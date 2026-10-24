@@ -37,51 +37,82 @@ const parseSizeText = function (sizeText) {
   return parseFloat(match[1]) * map[match[2].toLowerCase()];
 };
 
-const _getRssContent = async function (rssUrl, suffix = true) {
-  let body;
-  const cache = await redis.get(`vertex:rss:${rssUrl}`);
-  if (cache) {
-    body = cache;
-  } else {
-    let url = rssUrl;
-    const isPig = rssUrl.includes('https://piggo.me/');
-    const isKamept = rssUrl.includes('https://kamept.com/');
-    if (suffix && !isPig) {
-      if (isKamept) {
-        const randomNum = Math.floor(Math.random() * 100000000);
-        url += '&' + randomNum;
-      } else {
-        url += (rssUrl.indexOf('?') === -1 ? '?' : '&') + '____=' + Math.random();
-      }
-    }
-    let res;
-    if (rssUrl.includes('https://pt.soulvoice.club/') && global.runningSite.SoulVoice) {
-      res = await util.requestPromise({
-        url,
-        headers: {
-          cookie: global.runningSite.SoulVoice.cookie
-        }
-      }, true);
-    } else {
-      res = await util.requestPromise(url, true);
-    }
-    body = res.body;
-    const isHTML = body.indexOf('xml-viewer-style') !== -1;
-    if (isHTML) {
-      body = '<?xml version="1.0" encoding="utf-8"?>\n' + res.body.match(/<rss[\s\S]*<\/rss>/)[0];
-    }
-    const host = new URL(rssUrl).host;
-    let cacheTime = ['lemon', 'hhanclub'].some(item => host.indexOf(item) !== -1) ? 150 : 40;
-    if (host.indexOf('sharkpt') !== -1) {
-      cacheTime = 310;
-    }
-    await redis.setWithExpire(`vertex:rss:${rssUrl}`, body, isHTML ? 310 : cacheTime);
+const _parseRssContent = async function (body) {
+  const feed = await parseXml(body);
+  const channel = feed?.rss?.channel?.[0];
+  if (!channel || typeof channel !== 'object') {
+    throw new Error('RSS响应缺少有效的 channel');
   }
-  return body;
+  // 合法的空订阅不是抓取失败，所有站点适配器均可安全遍历。
+  channel.item = channel.item || [];
+  return feed;
+};
+
+// 返回已校验的 RSS 对象，只缓存有效 XML，不缓存错误页面。
+const _getRssContent = async function (rssUrl, suffix = true) {
+  const startTime = Date.now();
+  const host = new URL(rssUrl).host;
+  const cacheKey = `vertex:rss:${rssUrl}`;
+  const cache = await redis.get(cacheKey);
+  if (cache) {
+    try {
+      const feed = await _parseRssContent(cache);
+      logger.debug(host, `RSS源获取完成: 缓存命中, 耗时=${Date.now() - startTime}ms`);
+      return feed;
+    } catch (error) {
+      // 兼容升级前残留的无效缓存，本次立即重新请求，不再空等一个周期。
+      await redis.del(cacheKey);
+      logger.warn(host, 'RSS缓存无效，已清除并重新获取');
+    }
+  }
+
+  let url = rssUrl;
+  const isPig = rssUrl.includes('https://piggo.me/');
+  const isKamept = rssUrl.includes('https://kamept.com/');
+  if (suffix && !isPig) {
+    if (isKamept) {
+      const randomNum = Math.floor(Math.random() * 100000000);
+      url += '&' + randomNum;
+    } else {
+      url += (rssUrl.indexOf('?') === -1 ? '?' : '&') + '____=' + Math.random();
+    }
+  }
+  let res;
+  if (rssUrl.includes('https://pt.soulvoice.club/') && global.runningSite?.SoulVoice) {
+    res = await util.requestPromise({
+      url,
+      headers: {
+        cookie: global.runningSite.SoulVoice.cookie
+      }
+    }, true);
+  } else {
+    res = await util.requestPromise(url, true);
+  }
+  if (res.statusCode < 200 || res.statusCode >= 300) {
+    throw new Error(`RSS请求失败: HTTP ${res.statusCode}`);
+  }
+  let body = res.body;
+  if (typeof body !== 'string' || !body.trim()) {
+    throw new Error('RSS响应内容为空或不是文本');
+  }
+  if (body.indexOf('xml-viewer-style') !== -1) {
+    const match = body.match(/<rss\b[\s\S]*<\/rss>/i);
+    if (!match) throw new Error('RSS展示页面中未找到 RSS 内容');
+    body = '<?xml version="1.0" encoding="utf-8"?>\n' + match[0];
+  }
+  const feed = await _parseRssContent(body);
+  // 保留站点专用间隔；展示格式本身不应导致额外的 310 秒缓存。
+  let cacheTime = ['lemon', 'hhanclub'].some(item => host.indexOf(item) !== -1) ? 150 : 40;
+  if (host.indexOf('sharkpt') !== -1) {
+    cacheTime = 310;
+  }
+  await redis.setWithExpire(cacheKey, body, cacheTime);
+  logger.debug(host, `RSS源获取完成: 网络请求, 耗时=${Date.now() - startTime}ms, 缓存=${cacheTime}s`);
+  return feed;
 };
 
 const _getTorrents = async function (rssUrl) {
-  const rss = await parseXml(await _getRssContent(rssUrl));
+  const rss = await _getRssContent(rssUrl);
   const torrents = [];
   const items = rss.rss.channel[0].item;
   for (let i = 0; i < items.length; ++i) {
@@ -108,7 +139,7 @@ const _getTorrents = async function (rssUrl) {
 };
 
 const _getTorrentsMTeam = async function (rssUrl) {
-  const rss = await parseXml(await _getRssContent(rssUrl, false));
+  const rss = await _getRssContent(rssUrl, false);
   const torrents = [];
   const items = rss.rss.channel[0].item;
   for (let i = 0; i < items.length; ++i) {
@@ -135,7 +166,7 @@ const _getTorrentsMTeam = async function (rssUrl) {
 };
 
 const _getTorrentsPuTao = async function (rssUrl) {
-  const rss = await parseXml(await _getRssContent(rssUrl));
+  const rss = await _getRssContent(rssUrl);
   const torrents = [];
   const items = rss.rss.channel[0].item;
   for (let i = 0; i < items.length; ++i) {
@@ -173,7 +204,7 @@ const _getTorrentsPuTao = async function (rssUrl) {
 };
 
 const _getTorrentsFileList = async function (rssUrl) {
-  const rss = await parseXml(await _getRssContent(rssUrl));
+  const rss = await _getRssContent(rssUrl);
   const torrents = [];
   const items = rss.rss.channel[0].item;
   for (let i = 0; i < items.length; ++i) {
@@ -206,7 +237,7 @@ const _getTorrentsFileList = async function (rssUrl) {
 };
 
 const _getTorrentsBeyondHD = async function (rssUrl) {
-  const rss = await parseXml(await _getRssContent(rssUrl));
+  const rss = await _getRssContent(rssUrl);
   const torrents = [];
   const items = rss.rss.channel[0].item;
   for (let i = 0; i < items.length; ++i) {
@@ -238,7 +269,7 @@ const _getTorrentsBeyondHD = async function (rssUrl) {
 };
 
 const _getTorrentsUnit3D2 = async function (rssUrl) {
-  const rss = await parseXml(await _getRssContent(rssUrl));
+  const rss = await _getRssContent(rssUrl);
   const torrents = [];
   const items = rss.rss.channel[0].item;
   for (let i = 0; i < items.length; ++i) {
@@ -264,7 +295,7 @@ const _getTorrentsUnit3D2 = async function (rssUrl) {
 };
 
 const _getTorrentsUnit3D = async function (rssUrl) {
-  const rss = await parseXml(await _getRssContent(rssUrl));
+  const rss = await _getRssContent(rssUrl);
   const torrents = [];
   const items = rss.rss.channel[0].item;
   for (let i = 0; i < items.length; ++i) {
@@ -297,7 +328,7 @@ const _getTorrentsUnit3D = async function (rssUrl) {
 };
 
 const _getTorrentsTorrentDB = async function (rssUrl) {
-  const rss = await parseXml(await _getRssContent(rssUrl));
+  const rss = await _getRssContent(rssUrl);
   const torrents = [];
   const items = rss.rss.channel[0].item;
   for (let i = 0; i < items.length; ++i) {
@@ -329,7 +360,7 @@ const _getTorrentsTorrentDB = async function (rssUrl) {
 };
 
 const _getTorrentsLuminance = async function (rssUrl) {
-  const rss = await parseXml(await _getRssContent(rssUrl));
+  const rss = await _getRssContent(rssUrl);
   const torrents = [];
   const items = rss.rss.channel[0].item;
   for (let i = 0; i < items.length; ++i) {
@@ -355,7 +386,7 @@ const _getTorrentsLuminance = async function (rssUrl) {
 };
 
 const _getTorrentsGazelle = async function (rssUrl) {
-  const rss = await parseXml(await _getRssContent(rssUrl));
+  const rss = await _getRssContent(rssUrl);
   const torrents = [];
   const items = rss.rss.channel[0].item;
   for (let i = 0; i < items.length; ++i) {
@@ -402,7 +433,7 @@ const _getTorrentsGazelle = async function (rssUrl) {
 };
 
 const _getTorrentsSkyeySnow = async function (rssUrl) {
-  const rss = await parseXml(await _getRssContent(rssUrl));
+  const rss = await _getRssContent(rssUrl);
   const torrents = [];
   const items = rss.rss.channel[0].item;
   for (let i = 0; i < items.length; ++i) {
@@ -442,7 +473,7 @@ const _getTorrentsSkyeySnow = async function (rssUrl) {
 };
 
 const _getTorrentsHDBits = async function (rssUrl) {
-  const rss = await parseXml(await _getRssContent(rssUrl));
+  const rss = await _getRssContent(rssUrl);
   const torrents = [];
   const items = rss.rss.channel[0].item;
   for (let i = 0; i < items.length; ++i) {
@@ -482,7 +513,7 @@ const _getTorrentsHDBits = async function (rssUrl) {
 };
 
 const _getTorrentsHDTorrents = async function (rssUrl) {
-  const rss = await parseXml(await _getRssContent(rssUrl));
+  const rss = await _getRssContent(rssUrl);
   const torrents = [];
   const items = rss.rss.channel[0].item;
   for (let i = 0; i < items.length; ++i) {
@@ -507,7 +538,7 @@ const _getTorrentsHDTorrents = async function (rssUrl) {
 };
 
 const _getTorrentsHDCity = async function (rssUrl) {
-  const rss = await parseXml(await _getRssContent(rssUrl));
+  const rss = await _getRssContent(rssUrl);
   const torrents = [];
   const items = rss.rss.channel[0].item;
   for (let i = 0; i < items.length; ++i) {
@@ -532,7 +563,7 @@ const _getTorrentsHDCity = async function (rssUrl) {
 };
 
 const _getTorrentsIPTorrents = async function (rssUrl) {
-  const rss = await parseXml(await _getRssContent(rssUrl));
+  const rss = await _getRssContent(rssUrl);
   const torrents = [];
   const items = rss.rss.channel[0].item;
   for (let i = 0; i < items.length; ++i) {
@@ -559,7 +590,7 @@ const _getTorrentsIPTorrents = async function (rssUrl) {
 };
 
 const _getTorrentsMikanProject = async function (rssUrl) {
-  const rss = await parseXml(await _getRssContent(rssUrl));
+  const rss = await _getRssContent(rssUrl);
   const torrents = [];
   const items = rss.rss.channel[0].item;
   if (!items) return [];
@@ -586,7 +617,7 @@ const _getTorrentsMikanProject = async function (rssUrl) {
 };
 
 const _getTorrentsLearnFlakes = async function (rssUrl) {
-  const rss = await parseXml(await _getRssContent(rssUrl, false));
+  const rss = await _getRssContent(rssUrl, false);
   const torrents = [];
   const items = rss.rss.channel[0].item;
   for (let i = 0; i < items.length; ++i) {
@@ -617,7 +648,7 @@ const _getTorrentsLearnFlakes = async function (rssUrl) {
 };
 
 const _getTorrentsAvistaZ = async function (rssUrl) {
-  const rss = await parseXml(await _getRssContent(rssUrl));
+  const rss = await _getRssContent(rssUrl);
   const torrents = [];
   const items = rss.rss.channel[0].item;
   for (let i = 0; i < items.length; ++i) {
@@ -651,7 +682,7 @@ const _getTorrentsAvistaZ = async function (rssUrl) {
 };
 
 const _getTorrentsTorrentLeech = async function (rssUrl) {
-  const rss = await parseXml(await _getRssContent(rssUrl));
+  const rss = await _getRssContent(rssUrl);
   const torrents = [];
   const items = rss.rss.channel[0].item;
   for (let i = 0; i < items.length; ++i) {
@@ -694,7 +725,7 @@ const _getTorrentsTorrentLeech = async function (rssUrl) {
 };
 
 const _getTorrentsFSM = async function (rssUrl) {
-  const rss = await parseXml(await _getRssContent(rssUrl));
+  const rss = await _getRssContent(rssUrl);
   const torrents = [];
   const items = rss.rss.channel[0].item;
   for (let i = 0; i < items.length; ++i) {
@@ -719,7 +750,7 @@ const _getTorrentsFSM = async function (rssUrl) {
 };
 
 const _getTorrentsHappyFappy = async function (rssUrl) {
-  const rss = await parseXml(await _getRssContent(rssUrl));
+  const rss = await _getRssContent(rssUrl);
   const torrents = [];
   const items = rss.rss.channel[0].item;
   for (let i = 0; i < items.length; ++i) {
@@ -745,7 +776,7 @@ const _getTorrentsHappyFappy = async function (rssUrl) {
 };
 
 const _getTorrentsKimoji = async function (rssUrl) {
-  const rss = await parseXml(await _getRssContent(rssUrl));
+  const rss = await _getRssContent(rssUrl);
   const torrents = [];
   const items = rss.rss.channel[0].item;
   for (let i = 0; i < items.length; ++i) {
@@ -778,7 +809,7 @@ const _getTorrentsKimoji = async function (rssUrl) {
 };
 
 const _getTorrentsFappaizuri = async function (rssUrl) {
-  const rss = await parseXml(await _getRssContent(rssUrl, false));
+  const rss = await _getRssContent(rssUrl, false);
   const torrents = [];
   const items = rss.rss.channel[0].item;
   for (let i = 0; i < items.length; ++i) {
@@ -809,7 +840,7 @@ const _getTorrentsFappaizuri = async function (rssUrl) {
 };
 
 const _getTorrentsLusthive = async function (rssUrl) {
-  const rss = await parseXml(await _getRssContent(rssUrl));
+  const rss = await _getRssContent(rssUrl);
   const torrents = [];
   const items = rss.rss.channel[0].item;
   for (let i = 0; i < items.length; ++i) {
@@ -836,7 +867,7 @@ const _getTorrentsLusthive = async function (rssUrl) {
 };
 
 const _getTorrentsCinematik = async function (rssUrl) {
-  const rss = await parseXml(await _getRssContent(rssUrl));
+  const rss = await _getRssContent(rssUrl);
   const torrents = [];
   const items = rss.rss.channel[0].item;
   for (let i = 0; i < items.length; ++i) {
@@ -906,8 +937,9 @@ const _getTorrentsWrapper = {
 };
 
 exports.getTorrents = async function (rssUrl) {
-  const host = new URL(rssUrl).host;
+  let host = '无效RSS地址';
   try {
+    host = new URL(rssUrl).host;
     let torrents;
     if (host.indexOf('m-team') !== -1) {
       torrents = await _getTorrentsMTeam(rssUrl);
@@ -919,8 +951,12 @@ exports.getTorrents = async function (rssUrl) {
     torrents.forEach(torrent => { torrent.url = normalizeTorrentUrl(torrent.url); });
     return torrents;
   } catch (e) {
-    logger.error(host, '获取 Rss 报错', e);
-    return [];
+    // 不把失败伪装成空订阅；仅暴露主机及脱敏信息，避免日志泄露 passkey。
+    const message = String(e.message || e).replace(/https?:\/\/[^\s"'<>]+/gi, '[RSS URL]');
+    const error = new Error(`${host} 获取 RSS 失败: ${message}`);
+    if (e.code) error.code = e.code;
+    logger.error(error.message);
+    throw error;
   }
 };
 

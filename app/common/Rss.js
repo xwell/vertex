@@ -422,7 +422,25 @@ class Rss {
     this.ntf = new Push(this.notify);
   }
 
+  _logTorrentTiming (torrent, stage, startedAt, client) {
+    const now = Date.now();
+    const pubTime = Number(torrent.pubTime);
+    const hasPubTime = Number.isFinite(pubTime) && pubTime > 0;
+    const discoveredAt = torrent._rssDiscoveredAt;
+    logger.info(this.alias, 'RSS种子阶段:', JSON.stringify({
+      stage,
+      hash: torrent.hash,
+      client: client?.alias,
+      stageMs: Number.isFinite(startedAt) ? now - startedAt : 0,
+      discoveredAt: Number.isFinite(discoveredAt) ? moment(discoveredAt).format('YYYY-MM-DD HH:mm:ss.SSS') : null,
+      sinceDiscoveryMs: Number.isFinite(discoveredAt) ? now - discoveredAt : null,
+      publishedAt: hasPubTime ? moment.unix(pubTime).format('YYYY-MM-DD HH:mm:ss') : null,
+      sincePublicationMs: hasPubTime ? now - pubTime * 1000 : null
+    }));
+  }
+
   async _pushTorrent(torrent, _client) {
+    const pushStartedAt = Date.now();
     const records = { noteRows: [], noteCategoryRows: [], addRows: [] };
     const pushNoteRow = (target, reason, recordType = 2, clientId) => {
       const nowTime = moment().unix();
@@ -454,8 +472,8 @@ class Rss {
         clientId || null
       ]);
     };
-    const pushAddRow = (hashValue, target, categoryValue, note = '添加种子', clientId) => {
-      const nowTime = moment().unix();
+    const pushAddRow = (hashValue, target, categoryValue, note = '添加种子', clientId, addedAt = moment().unix()) => {
+      const nowTime = addedAt;
       const resolvedCategory = categoryValue !== undefined ? categoryValue : this.category;
       records.addRows.push([
         hashValue,
@@ -487,6 +505,7 @@ class Rss {
                 this.addCount += 1;
                 await client.addTorrent(this._normalizeTorrentUrl(torrent.url), torrent.hash, true, this.uploadLimit, this.downloadLimit, _torrent.savePath, this.category);
                 pushAddRow(torrent.hash, torrent, this.category, '辅种', client.id);
+                this._logTorrentTiming(torrent, '辅种完成', pushStartedAt, client);
                 await this.ntf.addTorrent(this._rss, client, torrent);
                 return records;
               } catch (error) {
@@ -634,8 +653,10 @@ class Rss {
         if (this.pushTorrentFile) {
           let filepath;
           let hash;
+          const downloadStartedAt = Date.now();
           try {
             ({ filepath, hash } = await this._downloadTorrent(torrent.url, torrent.hash));
+            this._logTorrentTiming(torrent, '种子文件下载完成', downloadStartedAt, client);
           } catch (downloadError) {
             logger.error(this.alias, '下载种子文件失败，尝试使用链接推送:', downloadError.message);
             await client.addTorrent(this._normalizeTorrentUrl(torrent.url), torrent.hash, false, this.uploadLimit, this.downloadLimit, savePath, category, this.autoTMM, this.paused);
@@ -652,11 +673,16 @@ class Rss {
               const [, pattern, flags] = match;
               const regex = new RegExp(pattern, flags);
               await client.addTorrent(torrentUrl.replace(regex, this.replaceStr), torrent.hash, false, this.uploadLimit, this.downloadLimit, savePath, category, this.autoTMM, this.paused);
+            } else {
+              throw new Error('种子下载链接替换正则表达式无效');
             }
           } else {
             await client.addTorrent(torrentUrl, torrent.hash, false, this.uploadLimit, this.downloadLimit, savePath, category, this.autoTMM, this.paused);
           }
         }
+
+        const addedAt = moment().unix();
+        this._logTorrentTiming(torrent, '添加完成', pushStartedAt, client);
 
         // 将种子添加到Redis缓存，用于跳过相同种子检查
         await this.cacheTorrentToClient(client.id, torrent);
@@ -665,14 +691,15 @@ class Rss {
           await this.cacheTorrentToClient(client.id, { ...torrent, hash: truehash });
         }
 
+        // 添加时间以下载器 API 完成为准，不把缓存及通知耗时算进去。
+        pushAddRow(torrent.hash, torrent, category, '添加种子', client.id, addedAt);
+        if (truehash && torrent.hash !== truehash) {
+          pushAddRow(truehash, torrent, category, '添加种子', client.id, addedAt);
+        }
         try {
           await this.ntf.addTorrent(this._rss, client, torrent);
         } catch (e) {
           logger.error('通知信息发送失败: \n', e);
-        }
-        pushAddRow(torrent.hash, torrent, category, '添加种子', client.id);
-        if (truehash && torrent.hash !== truehash) {
-          pushAddRow(truehash, torrent, category, '添加种子', client.id);
         }
         return records;
       } catch (error) {
@@ -711,7 +738,7 @@ class Rss {
     } else {
       // 从多个URL获取种子并合并，单个源失败不中断整体
       const results = await Promise.allSettled(this.urls.map(url => rss.getTorrents(url)));
-      const failedUrls = [];
+      const sourceErrors = [];
       let successCount = 0;
       for (let i = 0; i < results.length; i++) {
         const result = results[i];
@@ -719,17 +746,16 @@ class Rss {
           successCount += 1;
           torrents.push(...result.value);
         } else {
-          failedUrls.push({ url: this.urls[i], error: result.reason });
+          sourceErrors.push(result.reason);
         }
       }
-      if (failedUrls.length > 0) {
-        for (const item of failedUrls) {
-          logger.error(this.alias, `RSS源获取失败: ${item.url}`, item.error);
-        }
+      for (const error of sourceErrors) {
+        logger.error(this.alias, 'RSS源获取失败:', error);
       }
       if (successCount === 0) {
         const error = new Error('RSS获取失败: 所有源均失败');
         logger.error(this.alias, error.message);
+        await this.ntf.rssError(this._rss);
         throw error;
       }
 
@@ -745,7 +771,9 @@ class Rss {
       torrents = this._normalizeTorrentUrls(uniqueTorrents);
     }
 
-    logger.debug(this.alias, `获取种子完成，耗时: ${moment().diff(startTime, 'seconds')}秒，数量: ${torrents.length}`);
+    const fetchedAt = Date.now();
+    const fetchMs = fetchedAt - startTime.valueOf();
+    logger.debug(this.alias, `获取种子完成，耗时: ${fetchMs}ms，数量: ${torrents.length}`);
 
     // 过滤掉已处理和被冻结的种子和超过每小时推送上限的种子
     let newTorrents = [];
@@ -774,6 +802,10 @@ class Rss {
       if (torrent.hash && existingHashes.has(torrent.hash)) continue;
       // 检查是否被冻结
       if (torrent.name.indexOf('[FROZEN]') !== -1) continue;
+
+      // 本轮首次见到的未处理种子；与站点 pubDate 分开记录，便于定位源更新延迟。
+      torrent._rssDiscoveredAt = fetchedAt;
+      this._logTorrentTiming(torrent, '发现');
 
       // 检查拒绝规则
       let reject = false;
@@ -809,6 +841,8 @@ class Rss {
       await this._persistLastRssTime(moment().unix());
       return;
     }
+
+    logger.info(this.alias, `RSS阶段统计: 获取=${fetchMs}ms, 过滤=${Date.now() - fetchedAt}ms, 待处理=${newTorrents.length}`);
 
     // 获取所有可用的下载器
     const availableClients = this.clientArr
@@ -1399,7 +1433,7 @@ class Rss {
 
     // 处理每个下载器的种子分配（并行处理）
     const allProcessingTasks = [];
-    const maxConcurrent = 15; // 每个客户端的最大并发处理数量
+    const maxConcurrent = 15; // 同一 RSS 任务内，每个客户端的最大并发处理数量
     const insertNoteSql = 'INSERT INTO torrents (hash, name, size, rss_id, link, record_time, record_type, record_note, client_id) values (?, ?, ?, ?, ?, ?, ?, ?, ?)';
     const insertNoteWithCategorySql = 'INSERT INTO torrents (hash, name, size, rss_id, link, category, record_time, record_type, record_note, client_id) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)';
     const insertAddSql = 'INSERT INTO torrents (hash, name, size, rss_id, link, category, record_time, add_time, record_type, record_note, client_id) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)';
@@ -1444,11 +1478,13 @@ class Rss {
         }
       };
 
-      // 将客户端的种子分批处理
-      for (let i = 0; i < clientTorrents.length; i += maxConcurrent) {
-        const batch = clientTorrents.slice(i, i + maxConcurrent);
-        allProcessingTasks.push(processBatch(batch));
-      }
+      // 同一客户端必须等上一批结束再启动下一批；不同客户端仍然并行。
+      const processClient = async () => {
+        for (let i = 0; i < clientTorrents.length; i += maxConcurrent) {
+          await processBatch(clientTorrents.slice(i, i + maxConcurrent));
+        }
+      };
+      allProcessingTasks.push(processClient());
     }
 
     // 等待所有处理任务完成
@@ -1578,10 +1614,11 @@ class Rss {
   async scheduleRssFetch() {
     try {
       await this._persistLastAttemptTime(moment().unix());
-      await this.taskQueue.enqueue({
+      const taskId = await this.taskQueue.enqueue({
         rssId: this.id,
         action: 'fetchRss'
       });
+      if (taskId) logger.debug(this.alias, `RSS任务已调度: id=${taskId}`);
     } catch (error) {
       logger.error(`调度RSS任务失败: ${this.alias}`, error);
     }

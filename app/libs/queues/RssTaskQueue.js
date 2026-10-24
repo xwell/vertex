@@ -156,7 +156,8 @@ class RssTaskQueue extends TaskQueue {
 
   async executeTask(task) {
     const { rssId, action, params } = task.data;
-    
+    let timeoutId;
+
     try {
       // 再次检查阻塞状态
       if (this.isRssBlocked(rssId)) {
@@ -170,8 +171,14 @@ class RssTaskQueue extends TaskQueue {
         return;
       }
 
-      logger.debug(`开始执行RSS任务: ${rssInstance.alias}, 动作: ${action}`);
       const startTime = Date.now();
+      const queueWaitMs = Number.isFinite(task.timestamp) ? Math.max(0, startTime - task.timestamp) : 0;
+      const message = `开始执行RSS任务: ${rssInstance.alias}, 动作: ${action}, id=${task.id}, 排队耗时=${queueWaitMs}ms`;
+      if (queueWaitMs >= 1000) {
+        logger.info(message);
+      } else {
+        logger.debug(message);
+      }
 
       const timeoutMs = this._getActionTimeout(action, task.data);
       const taskPromise = (async () => {
@@ -186,7 +193,7 @@ class RssTaskQueue extends TaskQueue {
       })();
 
       const timeoutPromise = new Promise((resolve, reject) => {
-        setTimeout(() => {
+        timeoutId = setTimeout(() => {
           reject(new Error(`任务超时: ${action} (${Math.ceil(timeoutMs / 1000)}秒)`));
         }, timeoutMs);
       });
@@ -194,10 +201,12 @@ class RssTaskQueue extends TaskQueue {
       const result = await Promise.race([taskPromise, timeoutPromise]);
 
       const duration = Date.now() - startTime;
-      logger.debug(`RSS任务完成: ${rssInstance.alias}, 耗时: ${duration}ms`);
-      
-      // 记录成功
-      this.recordRssSuccess(rssId);
+      logger.debug(`RSS任务完成: ${rssInstance.alias}, id=${task.id}, 排队耗时=${queueWaitMs}ms, 执行耗时=${duration}ms`);
+
+      // 清零计数及“已在运行”的跳过不代表抓取成功，不能清除源的失败记录。
+      if (action === 'fetchRss' && result === true) {
+        this.recordRssSuccess(rssId);
+      }
       
       return result;
     } catch (error) {
@@ -207,8 +216,10 @@ class RssTaskQueue extends TaskQueue {
         return;
       }
       
-      // 记录失败
-      this.recordRssFailure(rssId, error);
+      // 只有实际抓取失败才计入 RSS 源的连续失败次数。
+      if (action === 'fetchRss') {
+        this.recordRssFailure(rssId, error);
+      }
       
       logger.error(`RSS任务执行失败: ${rssId}`, error);
       
@@ -223,6 +234,9 @@ class RssTaskQueue extends TaskQueue {
       
       // 不再重新抛出错误，让任务队列继续处理下一个任务
       logger.error(`RSS任务失败已处理: ${rssId}, 继续处理下一个任务`);
+    } finally {
+      // 正常完成也要释放计时器，避免每轮都残留一个五分钟的定时器。
+      clearTimeout(timeoutId);
     }
   }
 
@@ -230,7 +244,7 @@ class RssTaskQueue extends TaskQueue {
     // 检查是否已在运行
     if (rssInstance.isRunning) {
       logger.debug(`RSS ${rssInstance.alias} 已在运行中，跳过本次执行`);
-      return null;
+      return false;
     }
 
     rssInstance.isRunning = true;
@@ -238,6 +252,7 @@ class RssTaskQueue extends TaskQueue {
     try {
       // 直接调用原始的rss方法，利用其内置的去重逻辑
       await rssInstance.rss(params?.torrents);
+      return true;
     } finally {
       rssInstance.isRunning = false;
     }

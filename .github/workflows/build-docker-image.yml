@@ -40,6 +40,8 @@ jobs:
         npm i --save-dev
         cd webui
         npm i --legacy-peer-deps --save-dev
+    - name: RSS Regression Tests
+      run: npm run test:rss
     - name: Auto-fix ESLint Issues
       run: |
         npm run eslint -- --fix || true
