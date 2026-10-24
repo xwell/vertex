@@ -281,7 +281,7 @@
         <a-form-item
           label="最长休眠时间"
           name="maxSleepTime"
-          extra="最长休眠时间, 若上次成功 RSS 在 N 秒以前, 则本次 RSS 拒绝所有种子, 建议为 3-5 倍于 Rss 周期, 单位为秒"
+          extra="距上次成功获取并解析 RSS 超过 N 秒时，恢复后的本轮未处理种子全部拒绝，随后正常运行。首次运行或旧版本升级后无可信记录时同样保护一轮；抓取成功但无下载器或额度已满仍计为成功。建议为 Rss 周期的 3-5 倍，单位为秒，不按种子发布时间判断"
           :rules="[{ required: true, message: '${label}不可为空! ' }]">
           <a-input size="small" v-model:value="rss.maxSleepTime"/>
         </a-form-item>

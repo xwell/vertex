@@ -34,6 +34,7 @@ function setup (getTorrents = async () => [], moment = realMoment) {
     addCountPerHour: 0,
     addCount: 0,
     maxSleepTime: 600,
+    lastRssTime: moment().unix() - 60,
     ntf: {
       rssError: async () => {},
       rejectTorrent: async () => {},
@@ -41,7 +42,10 @@ function setup (getTorrents = async () => [], moment = realMoment) {
       addTorrentError: async () => {}
     },
     cacheTorrentToClient: async () => {},
-    _persistLastRssTime: async timestamp => { task.persisted = timestamp; }
+    _persistLastRssTime: async timestamp => {
+      task.persisted = timestamp;
+      task.lastRssTime = timestamp;
+    }
   });
   return { task, logger, writes };
 }
@@ -130,7 +134,7 @@ test('each client runs at most 15 torrent jobs in one RSS task, while clients re
   assert.equal(handled.size, 80);
   assert.equal(overlapped, true);
   assert.equal(writes.flatMap(write => write.rows).length, 79);
-  assert.ok(task.persisted > 0);
+  assert.equal(task.persisted, undefined); // 手动传入种子不刷新订阅成功时间。
   const discovery = logger.entries.filter(entry => entry.args[1] === 'RSS种子阶段:')
     .map(entry => JSON.parse(entry.args[2]));
   assert.equal(discovery.length, 80);

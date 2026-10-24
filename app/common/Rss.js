@@ -16,16 +16,15 @@ class Rss {
   constructor(rss) {
     this._rss = rss;
     this.id = rss.id;
-    this.maxSleepTime = rss.maxSleepTime;
+    this.alias = rss.alias;
+    const maxSleepTime = Number(rss.maxSleepTime);
+    this.maxSleepTime = Number.isFinite(maxSleepTime) && maxSleepTime >= 0 ? maxSleepTime : 600;
     this.lastRssTime = 0;
-    this.lastRssTimeKey = `vertex:rss:last_time:${this.id}`;
+    // 旧 last_time 可能把抓取失败记为成功，不能用作新保护逻辑的基线。
+    this.lastRssTimeKey = `vertex:rss:last_success:${this.id}`;
     this.lastRssTimeReady = this._loadLastRssTime();
-    this.lastAttemptTime = 0;
-    this.lastAttemptTimeKey = `vertex:rss:last_attempt:${this.id}`;
-    this.lastAttemptTimeReady = this._loadLastAttemptTime();
     this.rateLimitKey = `vertex:rss:rate:${this.id}`;
     this.rateLimitResetReady = this._resetRateLimitCounter();
-    this.alias = rss.alias;
     this.urls = rss.rssUrls;
     this.clientArr = rss.clientArr || [rss.client];
     this.clientSortBy = rss.clientSortBy;
@@ -115,26 +114,14 @@ class Rss {
     try {
       const stored = await redis.get(this.lastRssTimeKey);
       const parsed = Number(stored);
-      if (Number.isFinite(parsed) && parsed > 0) {
+      if (Number.isFinite(parsed) && parsed > 0 && parsed <= moment().unix()) {
         this.lastRssTime = parsed;
-        logger.info(this.alias, `加载上次RSS执行时间: ${moment.unix(parsed).format('YYYY-MM-DD HH:mm:ss')}`);
+        logger.info(this.alias, `加载上次RSS成功抓取时间: ${moment.unix(parsed).format('YYYY-MM-DD HH:mm:ss')}`);
+      } else if (stored) {
+        logger.warn(this.alias, 'RSS成功抓取时间无效，将启用首轮保护');
       }
     } catch (error) {
-      logger.error(this.alias, '加载上次RSS执行时间失败:', error);
-    }
-  }
-
-  async _loadLastAttemptTime() {
-    if (!this.lastAttemptTimeKey) return;
-    try {
-      const stored = await redis.get(this.lastAttemptTimeKey);
-      const parsed = Number(stored);
-      if (Number.isFinite(parsed) && parsed > 0) {
-        this.lastAttemptTime = parsed;
-        logger.info(this.alias, `加载上次RSS尝试时间: ${moment.unix(parsed).format('YYYY-MM-DD HH:mm:ss')}`);
-      }
-    } catch (error) {
-      logger.error(this.alias, '加载上次RSS尝试时间失败:', error);
+      logger.error(this.alias, '加载上次RSS成功抓取时间失败，将启用首轮保护:', error);
     }
   }
 
@@ -145,18 +132,7 @@ class Rss {
     try {
       await redis.set(this.lastRssTimeKey, String(timestamp));
     } catch (error) {
-      logger.error(this.alias, '持久化RSS执行时间失败:', error);
-    }
-  }
-
-  async _persistLastAttemptTime(timestamp) {
-    if (!this.lastAttemptTimeKey) return;
-    if (!Number.isFinite(timestamp)) return;
-    this.lastAttemptTime = timestamp;
-    try {
-      await redis.set(this.lastAttemptTimeKey, String(timestamp));
-    } catch (error) {
-      logger.error(this.alias, '持久化RSS尝试时间失败:', error);
+      logger.error(this.alias, '持久化RSS成功抓取时间失败:', error);
     }
   }
 
@@ -721,10 +697,6 @@ class Rss {
       await this.lastRssTimeReady;
       this.lastRssTimeReady = null;
     }
-    if (this.lastAttemptTimeReady) {
-      await this.lastAttemptTimeReady;
-      this.lastAttemptTimeReady = null;
-    }
     if (this.rateLimitResetReady) {
       await this.rateLimitResetReady;
       this.rateLimitResetReady = null;
@@ -775,6 +747,17 @@ class Rss {
     const fetchMs = fetchedAt - startTime.valueOf();
     logger.debug(this.alias, `获取种子完成，耗时: ${fetchMs}ms，数量: ${torrents.length}`);
 
+    // 使用上一轮真正成功抓取的时间，而不是当前轮调度/开始尝试的时间。
+    // 手动推送不属于订阅抓取，既不触发休眠保护，也不刷新成功基线。
+    const successTime = moment().unix();
+    const previousSuccessTime = this.lastRssTime;
+    const hasSuccessTime = Number.isFinite(previousSuccessTime) && previousSuccessTime > 0 && previousSuccessTime <= successTime;
+    const rejectAfterSleep = !_torrents && (!hasSuccessTime || successTime - previousSuccessTime > this.maxSleepTime);
+    if (!_torrents && !rejectAfterSleep) {
+      // 成功获取/解析即记为成功，不能被下载器状态、额度、规则或后续推送结果影响。
+      await this._persistLastRssTime(successTime);
+    }
+
     // 过滤掉已处理和被冻结的种子和超过每小时推送上限的种子
     let newTorrents = [];
 
@@ -793,6 +776,19 @@ class Rss {
           existingHashes.add(row.hash);
         }
       }
+    }
+
+    // 长期失败恢复、首次运行及旧版本迁移时，先将本轮未处理种子记为拒绝。
+    // 拒绝记录落库前不能前移基线，否则写入失败后的下一轮可能补抓整个历史列表。
+    if (rejectAfterSleep) {
+      const pendingTorrents = torrents.filter(torrent => !existingHashes.has(torrent.hash) && torrent.name.indexOf('[FROZEN]') === -1);
+      const detail = hasSuccessTime
+        ? `距上次成功抓取 ${successTime - previousSuccessTime}s, 阈值 ${this.maxSleepTime}s`
+        : '无可信成功抓取记录，启用首轮保护';
+      logger.warn(this.alias, `触发最长休眠时间拒绝: ${detail}, 待处理 ${pendingTorrents.length}`);
+      await this._batchRejectTorrents(pendingTorrents, '拒绝原因: 最长休眠时间');
+      await this._persistLastRssTime(successTime);
+      return;
     }
 
     // 过滤种子
@@ -838,7 +834,6 @@ class Rss {
 
     // 如果没有有效种子，直接返回
     if (newTorrents.length === 0) {
-      await this._persistLastRssTime(moment().unix());
       return;
     }
 
@@ -864,18 +859,6 @@ class Rss {
     if (availableClients.length === 0) {
       logger.error(this.alias, '无可用下载器');
       await this._batchRejectTorrents(newTorrents, '拒绝原因: 无可用下载器');
-      return;
-    }
-
-    // 检查最长休眠时间
-    const nowTime = moment().unix();
-    const lastAttemptTime = this.lastAttemptTime && this.lastAttemptTime > 0 ? this.lastAttemptTime : this.lastRssTime;
-    if (lastAttemptTime && nowTime - lastAttemptTime > +this.maxSleepTime) {
-      const sleepSeconds = nowTime - lastAttemptTime;
-      logger.warn(this.alias, `触发最长休眠时间拒绝: 休眠 ${sleepSeconds}s, 阈值 ${this.maxSleepTime}s, 上次尝试 ${lastAttemptTime}, 待处理 ${newTorrents.length}`);
-      await this._batchRejectTorrents(newTorrents, '拒绝原因: 最长休眠时间');
-      await this._persistLastRssTime(nowTime);
-      await this._persistLastAttemptTime(nowTime);
       return;
     }
 
@@ -1490,8 +1473,6 @@ class Rss {
     // 等待所有处理任务完成
     await Promise.all(allProcessingTasks);
     logger.info(this.alias, `RSS任务并行处理完成，共处理 ${newTorrents.length} 个种子`);
-
-    await this._persistLastRssTime(moment().unix());
   }
 
   async dryrun() {
@@ -1613,7 +1594,6 @@ class Rss {
   // 调度RSS获取任务
   async scheduleRssFetch() {
     try {
-      await this._persistLastAttemptTime(moment().unix());
       const taskId = await this.taskQueue.enqueue({
         rssId: this.id,
         action: 'fetchRss'
