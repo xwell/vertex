@@ -7,6 +7,7 @@ const md5 = require('md5-node');
 const CryptoJS = require('crypto-js');
 const cron = require('node-cron');
 const request = require('request');
+const requestWithDeadline = require('./request-with-deadline');
 const Database = require('better-sqlite3');
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
@@ -225,7 +226,7 @@ exports.scrapeFree = scrape.free;
 exports.scrapeHr = scrape.hr;
 
 exports._requestPromise = util.promisify(request);
-exports.requestPromise = async function (_options, usePuppeteer = true) {
+exports.requestPromise = async function (_options, usePuppeteer = true, deadline = null) {
   let options;
   if (typeof _options === 'string') {
     options = {
@@ -250,7 +251,7 @@ exports.requestPromise = async function (_options, usePuppeteer = true) {
   if (global.trustAllCerts) {
     options.rejectUnauthorized = !global.trustAllCerts;
   }
-  const res = await exports._requestPromise(options);
+  const res = deadline ? await requestWithDeadline(options, deadline) : await exports._requestPromise(options);
   if (usePuppeteer && res.body && typeof res.body === 'string' && (res.body.indexOf('trk_jschal_js') !== -1 || res.body.indexOf('jschl-answer') !== -1 || (res.body.indexOf('cloudflare-static') !== -1 && res.body.indexOf('email-decode.min.js') === -1))) {
     logger.info(new url.URL(options.url).hostname, '疑似遇到 5s 盾, 启用 Puppeteer 抓取页面....');
     return await exports.requestUsePuppeteer(options);

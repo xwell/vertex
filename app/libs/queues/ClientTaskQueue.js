@@ -1,6 +1,7 @@
 const { TaskQueue } = require('../redis');
 const logger = require('../logger');
 const redis = require('../redis');
+const trackerSync = require('../tracker-sync');
 
 class ClientTaskQueueWorker extends TaskQueue {
   constructor(queueName, executor, options) {
@@ -18,7 +19,7 @@ class ClientTaskQueue {
     this.actionTimeoutMs = {
       getMaindata: 30000,
       autoDelete: 300000,
-      trackerSync: 300000,
+      trackerSync: 10000,
       autoReannounce: 60000,
       record: 120000,
       flashFitTime: 60000
@@ -27,6 +28,10 @@ class ClientTaskQueue {
     this.activeClientTasks = new Map();
     this.lowPriorityActions = new Set(['record', 'autoReannounce']);
     this.busyRetryDelayMs = 5000;
+    this.foregroundActions = new Set(['getMaindata', 'autoDelete', 'flashFitTime']);
+    this.foregroundPending = new Map();
+    this.trackerContinuations = new Map();
+    this.trackerRefreshRequired = new Map();
 
     this.failedClients = new Map();
     this.blockDuration = 2 * 60 * 1000;
@@ -41,7 +46,6 @@ class ClientTaskQueue {
     this.slowActions = new Set(['autoDelete', 'trackerSync', 'record', 'autoReannounce']);
     this.circuitTrackedActions = new Set(['getMaindata']);
     this.circuitProbeActions = new Set(['getMaindata']);
-    this.trackerSyncUrgentInterval = 10 * 60;
 
     this.fastQueue = new ClientTaskQueueWorker('client_fast', this, { maxConcurrent: 6 });
     this.slowQueue = new ClientTaskQueueWorker('client_slow', this, { maxConcurrent: 4 });
@@ -53,7 +57,7 @@ class ClientTaskQueue {
 
   _getActionTimeout(action, taskData) {
     if (taskData && Number.isFinite(taskData.timeoutMs) && taskData.timeoutMs > 0) {
-      return taskData.timeoutMs;
+      return action === 'trackerSync' ? Math.min(taskData.timeoutMs, this.actionTimeoutMs.trackerSync) : taskData.timeoutMs;
     }
     return this.actionTimeoutMs[action] || 30000;
   }
@@ -84,10 +88,24 @@ class ClientTaskQueue {
     return this.circuitProbeActions.has(action);
   }
 
-  _shouldPromoteTrackerSync(client) {
-    if (!client || !client.lastTrackerSyncTime) return true;
-    const now = Math.floor(Date.now() / 1000);
-    return now - client.lastTrackerSyncTime >= this.trackerSyncUrgentInterval;
+  _hasForegroundPending (clientId) {
+    const pending = this.foregroundPending.get(clientId);
+    if (!pending) return false;
+    for (const [action, at] of pending) if (Date.now() - at > 60000) pending.delete(action);
+    if (!pending.size) this.foregroundPending.delete(clientId);
+    return pending.size > 0;
+  }
+
+  _continueTrackerSync (client) {
+    if (this.trackerContinuations.has(client.id)) return;
+    const timer = setTimeout(() => {
+      this.trackerContinuations.delete(client.id);
+      if (global.runningClient?.[client.id] !== client) return;
+      this.enqueue({ clientId: client.id, action: 'trackerSync' }, 'normal').catch(error => {
+        logger.error(`Tracker分片入队失败: ${client.alias}`, error);
+      });
+    }, trackerSync.limits.continueDelayMs);
+    this.trackerContinuations.set(client.id, timer);
   }
 
   _getOrCreateClientInfo(clientId) {
@@ -244,12 +262,13 @@ class ClientTaskQueue {
       }
     }
 
-    let actualPriority = priority;
-    if (action === 'trackerSync') {
-      const client = global.runningClient && global.runningClient[clientId];
-      if (this._shouldPromoteTrackerSync(client)) {
-        actualPriority = 'high';
-      }
+    // Even overdue Tracker maintenance must not jump ahead of deletes/refreshes.
+    const actualPriority = action === 'trackerSync' ? 'normal' : priority;
+    if (this.foregroundActions.has(action)) {
+      if (!this.foregroundPending.has(clientId)) this.foregroundPending.set(clientId, new Map());
+      this.foregroundPending.get(clientId).set(action, Date.now());
+      const active = this.activeClientTasks.get(clientId);
+      if (active?.action === 'trackerSync') active.control?.abort('foreground-pending');
     }
 
     const dedupeConfig = this._getDedupeConfig(taskData);
@@ -334,6 +353,12 @@ class ClientTaskQueue {
   }
 
   async cleanupClientOnDestroy(clientId) {
+    const timer = this.trackerContinuations.get(clientId);
+    if (timer) clearTimeout(timer);
+    this.trackerContinuations.delete(clientId);
+    this.trackerRefreshRequired.delete(clientId);
+    this.foregroundPending.delete(clientId);
+    this.activeClientTasks.get(clientId)?.control?.abort('client-destroyed');
     const clientInfo = this.failedClients.get(clientId);
     if (clientInfo) {
       this.failedClients.delete(clientId);
@@ -352,7 +377,8 @@ class ClientTaskQueue {
 
   async executeTask(task) {
     const { clientId, action, params } = task.data;
-    let lockAcquired = false;
+    let lockToken = null;
+    let timeoutTimer = null;
 
     try {
       if (this.isClientBlocked(clientId)) {
@@ -368,6 +394,12 @@ class ClientTaskQueue {
 
       const activeTask = this.activeClientTasks.get(clientId);
       if (activeTask) {
+        // A fixed 5s retry can phase-lock forever with flashFitTime's 5s cron.
+        // Maintenance uses its deduplicated 2s continuation instead, while foreground retry semantics stay unchanged.
+        if (action === 'trackerSync') {
+          this._continueTrackerSync(client);
+          return;
+        }
         if (this._isLowPriority(action)) {
           logger.debug(`客户端 ${client.alias} 正在执行 ${activeTask.action}，跳过低优先级任务: ${action}`);
           return;
@@ -403,15 +435,16 @@ class ClientTaskQueue {
         }
       }
 
-      this.activeClientTasks.set(clientId, { action, startTime: Date.now() });
-      lockAcquired = true;
+      lockToken = { action, startTime: Date.now(), control: action === 'trackerSync' ? trackerSync.createControl() : null };
+      this.activeClientTasks.set(clientId, lockToken);
 
       logger.debug(`开始执行客户端任务: ${client.alias}, 动作: ${action}`);
       const startTime = Date.now();
 
       const timeoutMs = this._getActionTimeout(action, task.data);
       const timeoutPromise = new Promise((resolve, reject) => {
-        setTimeout(() => {
+        timeoutTimer = setTimeout(() => {
+          lockToken.control?.abort('task-timeout');
           reject(new Error(`任务超时: ${action} (${Math.ceil(timeoutMs / 1000)}秒)`));
         }, timeoutMs);
       });
@@ -423,7 +456,7 @@ class ClientTaskQueue {
           case 'autoDelete':
             return await this.executeAutoDelete(client, params);
           case 'trackerSync':
-            return await this.executeTrackerSync(client);
+            return await this.executeTrackerSync(client, lockToken.control);
           case 'autoReannounce':
             return await this.executeAutoReannounce(client);
           case 'record':
@@ -462,15 +495,19 @@ class ClientTaskQueue {
       }
 
       const client = global.runningClient[clientId];
-      if (client) {
+      if (client && action !== 'trackerSync') {
         client.errorCount++;
         client.status = false;
       }
 
       logger.error(`客户端任务失败已处理: ${clientId}, 继续处理下一个任务`);
     } finally {
-      if (lockAcquired && this.activeClientTasks.get(clientId)?.action === action) {
-        this.activeClientTasks.delete(clientId);
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      lockToken?.control?.abort('slice-ended');
+      if (lockToken && this.activeClientTasks.get(clientId) === lockToken) this.activeClientTasks.delete(clientId);
+      if (lockToken && this.foregroundActions.has(action)) {
+        this.foregroundPending.get(clientId)?.delete(action);
+        if (!this.foregroundPending.get(clientId)?.size) this.foregroundPending.delete(clientId);
       }
     }
   }
@@ -539,17 +576,34 @@ class ClientTaskQueue {
     return await client.autoDelete();
   }
 
-  async executeTrackerSync(client) {
-    if (client.client.type !== 'qBittorrent') {
+  async executeTrackerSync(client, signal) {
+    // client.client is the adapter module (qb.js), which has no type property.
+    // Use the configured downloader type, as Client's inline path did before this refactor.
+    if (client._client?.type !== 'qBittorrent') return;
+    const blocked = trackerSync.blockReason(client);
+    if (blocked) {
+      logger.debug(`Tracker同步让出: ${client.alias}, 原因: ${blocked}`);
+      if (blocked === 'snapshot-stale') await this.enqueue({ clientId: client.id, action: 'getMaindata' }, 'high');
       return;
     }
-    if (!client.status) {
-      logger.debug(`客户端离线，跳过Tracker同步: ${client.alias}`);
+    if (this._hasForegroundPending(client.id)) {
+      this._continueTrackerSync(client);
       return;
     }
-
-    logger.debug(`执行Tracker同步: ${client.alias}`);
-    return await client.trackerSync();
+    const refreshAfter = this.trackerRefreshRequired.get(client.id);
+    if (refreshAfter !== undefined && client.lastMaindataSuccessTime <= refreshAfter) {
+      await this.enqueue({ clientId: client.id, action: 'getMaindata' }, 'high');
+      this._continueTrackerSync(client);
+      return;
+    }
+    this.trackerRefreshRequired.delete(client.id);
+    const result = await client.trackerSync({ signal, shouldYield: () => this._hasForegroundPending(client.id) });
+    if (signal?.aborted && signal.reason !== 'foreground-pending') return result;
+    if (global.runningClient?.[client.id] === client && result?.remaining > 0) {
+      this.trackerRefreshRequired.set(client.id, client.lastMaindataSuccessTime);
+      this._continueTrackerSync(client);
+    }
+    return result;
   }
 
   async executeAutoReannounce(client) {

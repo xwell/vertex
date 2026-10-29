@@ -229,15 +229,16 @@ exports.pauseTorrent = async (clientUrl, cookie, hash) => {
   return res;
 };
 
-exports.getTrackerList = async (clientUrl, cookie, hash) => {
+exports.getTrackerList = async (clientUrl, cookie, hash, deadline = null) => {
   const message = {
     url: clientUrl + `/api/v2/torrents/trackers?hash=${hash}`,
     headers: {
       cookie
     }
   };
-  const res = await util.requestPromise(message);
-  return res;
+  if (deadline) message.timeout = deadline.timeoutMs;
+  // Downloader JSON APIs must not fall back to a browser outside the request budget.
+  return await util.requestPromise(message, false, deadline);
 };
 
 exports.getFiles = async (clientUrl, cookie, hash) => {

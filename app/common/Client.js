@@ -8,6 +8,7 @@ const logger = require('../libs/logger');
 const cron = require('node-cron');
 const Push = require('./Push');
 const ClientTaskQueue = require('../libs/queues/ClientTaskQueue');
+const trackerSync = require('../libs/tracker-sync');
 
 const clients = {
   qBittorrent: qb,
@@ -86,6 +87,7 @@ class Client {
     this.lastMaindataSuccessTime = 0;
     this.trackerSyncCursor = 0;
     this.trackerSyncBatchSize = client.trackerSyncBatchSize || 50;
+    this.trackerSyncBatch = null;
     this.pausedTorrentHashes = [];
     this.getMaindata();
     this.avgUploadSpeed = 0;
@@ -569,8 +571,8 @@ class Client {
         const ageText = maindataAge === null ? 'unknown' : `${maindataAge}s`;
         logger.warn(`下载器 ${this.alias} maindata 过期(${ageText})，跳过 tracker 状态刷新`);
       } else if (!this.lastTrackerSyncTime || now - this.lastTrackerSyncTime >= minInterval) {
-        logger.debug(`下载器 ${this.alias} 开始刷新 tracker 状态以支持站点删种规则`);
-        await this.trackerSync();
+        logger.debug(`下载器 ${this.alias} 后台刷新 tracker 状态，删种不等待Tracker批请求`);
+        await this.scheduleTrackerSync();
       }
       if (!this.maindata || !this.maindata.torrents || this.maindata.torrents.length === 0) {
         logger.debug(`下载器 ${this.alias} maindata 缺失，跳过 tracker 状态回填`);
@@ -695,48 +697,86 @@ class Client {
     }
   }
 
-  async trackerSync() {
-    if (!this.maindata || !this.maindata.torrents || this.maindata.torrents.length === 0) {
-      logger.debug(`下载器 ${this.alias} tracker同步跳过: maindata=${!!this.maindata}, torrents=${this.maindata?.torrents?.length || 0}`);
-      return;
+  async trackerSync ({ signal, shouldYield = () => false } = {}) {
+    const limits = trackerSync.limits;
+    const reason = () => signal?.aborted ? (signal.reason || 'cancelled') : trackerSync.blockReason(this) || (shouldYield() ? 'foreground-pending' : null);
+    if (reason() || !this.maindata?.torrents?.length) return { remaining: 0, reason: reason() || 'empty' };
+    const started = Date.now();
+    if (this.trackerSyncBatch && started - this.trackerSyncBatch.started >= limits.batchMaxMs) {
+      this.trackerSyncBatch = null;
+      logger.info(`下载器 ${this.alias} tracker同步分片让出: batch-expired`);
+      return { remaining: 0, reason: 'batch-expired' };
     }
     const torrents = this.maindata.torrents;
     const total = torrents.length;
-    const batchSize = Math.min(this.trackerSyncBatchSize || 50, total);
-    const batch = [];
-    for (let i = 0; i < batchSize; i++) {
-      const index = (this.trackerSyncCursor + i) % total;
-      batch.push(torrents[index]);
+    if (!this.trackerSyncBatch) {
+      const size = Math.min(total, 50, Math.max(1, Math.floor(Number(this.trackerSyncBatchSize) || 50)));
+      const cursor = this.trackerSyncCursor || 0;
+      this.trackerSyncBatch = { started, index: 0, items: Array.from({ length: size }, (_, i) => torrents[(cursor + i) % total].hash) };
     }
-    this.trackerSyncCursor = (this.trackerSyncCursor + batch.length) % total;
+    const batch = this.trackerSyncBatch;
+    const current = new Map(torrents.map(t => [t.hash, t]));
+    const until = Math.min(started + limits.sliceMs, batch.started + limits.batchMaxMs);
+    let visited = 0;
     let syncCount = 0;
-    for (const torrent of batch) {
+    let stop = null;
+    const consume = () => {
+      batch.index++;
+      visited++;
+      this.trackerSyncCursor = ((this.trackerSyncCursor || 0) + 1) % total;
+    };
+    while (batch.index < batch.items.length && visited < limits.sliceTorrents) {
+      stop = reason();
+      if (stop || Date.now() >= until) break;
+      const hash = batch.items[batch.index];
+      if (!current.has(hash)) { consume(); continue; }
       try {
-        if (await redis.get(`vertex:torrent_tracker:${torrent.hash}`)) continue;
-        const sqlRes = await util.getRecord('SELECT * FROM torrents WHERE hash = ?', [torrent.hash]);
+        const cached = await redis.get(`vertex:torrent_tracker:${hash}`);
+        if ((stop = reason()) || Date.now() >= until) break;
+        if (cached) { consume(); continue; }
+        const sqlRes = await util.getRecord('SELECT * FROM torrents WHERE hash = ?', [hash]);
+        if ((stop = reason()) || Date.now() >= until) break;
         if (sqlRes && !!sqlRes.delete_time) {
-          await redis.set(`vertex:torrent_tracker:${torrent.hash}`, 1);
-          continue;
-        };
-        const { statusCode, body } = await this.client.getTrackerList(this.clientUrl, this.cookie, torrent.hash);
-        if (statusCode === 404) {
-          logger.debug('下载器', this.alias, '种子', torrent.name, 'tracker 状态同步 404');
+          await redis.set(`vertex:torrent_tracker:${hash}`, 1);
+          if ((stop = reason())) break;
+          consume();
           continue;
         }
-        if (statusCode !== 200) {
-          throw new Error('状态码: ' + statusCode);
+        const timeoutMs = Math.max(1, Math.min(limits.requestTimeoutMs, until - Date.now()));
+        const { statusCode, body } = await this.client.getTrackerList(this.clientUrl, this.cookie, hash, { timeoutMs, signal });
+        if ((stop = reason()) || Date.now() >= until) break;
+        if (statusCode === 200) {
+          const list = JSON.parse(body);
+          if (!Array.isArray(list)) throw new Error('invalid tracker response');
+          this.trackerStatus[hash] = list.filter(i => typeof i.url === 'string' && !i.url.includes('**')).map(i => i.msg || '').join('');
+          syncCount++;
+        } else if (statusCode !== 404) {
+          const error = new Error('tracker HTTP error');
+          error.code = 'HTTP_' + statusCode;
+          throw error;
         }
-        const trackerList = JSON.parse(body);
-        this.trackerStatus[torrent.hash] = trackerList.filter(i => i.url.indexOf('**') === -1).map(i => i.msg).join('');
-        syncCount++;
-      } catch (e) {
-        logger.error('下载器', this.alias, '种子', torrent.name, 'tracker 状态同步失败, 报错如下:\n', e);
+        consume();
+      } catch (error) {
+        if ((stop = reason()) || error.code === 'EABORTED') { stop = stop || 'cancelled'; break; }
+        // Do not log request objects, credentials, tracker URLs or response bodies.
+        logger.warn(`下载器 ${this.alias} tracker同步请求失败: hash=${hash}, code=${error.code || 'INVALID_RESPONSE'}`);
+        consume();
+        stop = 'request-error';
+        break;
       }
     }
-    this.lastTrackerSyncTime = moment().unix();
-    if (syncCount > 0) {
-      logger.info(`下载器 ${this.alias} tracker同步完成: ${syncCount}/${batch.length} 个种子 (总数: ${total})`);
-    }
+    const remaining = batch.items.length - batch.index;
+    if (!remaining && this.trackerSyncBatch === batch) this.trackerSyncBatch = null;
+    if (syncCount > 0 && !signal?.aborted) this.lastTrackerSyncTime = moment().unix();
+    const result = {
+      remaining,
+      visited,
+      synced: syncCount,
+      elapsedMs: Date.now() - started,
+      reason: stop || (Date.now() >= until ? 'slice-budget' : remaining ? 'slice-limit' : 'complete')
+    };
+    logger.info(`下载器 ${this.alias} tracker同步分片: ${syncCount}/${visited}, 剩余=${remaining}, 耗时=${result.elapsedMs}ms, 让出=${result.reason}`);
+    return result;
   };
 
   async pushSpaceAlarm() {
