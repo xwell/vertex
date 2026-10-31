@@ -1,4 +1,5 @@
 const bandwidth = require('./bandwidth');
+const rssAudit = require('./rss-audit');
 
 const MiB = 1024 * 1024;
 const limits = Object.freeze({
@@ -154,7 +155,10 @@ class RssAllocator {
 
   inspect (client, request = {}, own) {
     const now = this.now();
-    const reject = reason => ({ eligible: false, reason, client });
+    const input = request.audit ? rssAudit.snapshot(client, now) : undefined;
+    const detail = values => { if (input) Object.assign(input, values); };
+    const reject = reason => ({ eligible: false, reason, client, audit: input });
+    detail({ currentRuntime: !!client && this.clients()[client.id] === client, snapshotFresh: this._fresh(client, now) });
     if (!client || this.clients()[client.id] !== client || !client.status || !client.maindata) return reject('client-offline');
     if (!this._fresh(client, now)) return reject('snapshot-stale');
     const data = client.maindata;
@@ -162,20 +166,33 @@ class RssAllocator {
     const pending = this._pending(client, own);
     const rss = request.rss || {};
     const groupIds = this._groupIds(client.id);
+    detail({
+      pendingAdds: pending.total,
+      pendingDownloading: pending.count,
+      pendingBytes: pending.bytes,
+      apiActive: pending.concurrent,
+      effectiveDownloading: Number(data.leechingCount) + pending.count,
+      sharedGroupIds: groupIds.map(rssAudit.id),
+      sharedPeers: []
+    });
     let up = 0;
     let down = 0;
     let physicalReservedBytes = 0;
     let physicalConcurrent = 0;
     for (const id of groupIds) {
       const peer = this.clients()[id];
+      const peerInput = input ? { clientId: rssAudit.id(id), ...rssAudit.snapshot(peer, now) } : null;
+      if (input) input.sharedPeers.push(peerInput);
       if (!peer) continue; // disabled/removed sibling has no active workload here
       if (!peer.status || !peer.maindata || !this._fresh(peer, now) || !nonnegative(peer.maindata.uploadSpeed) || !nonnegative(peer.maindata.downloadSpeed)) return reject('shared-server-stale');
       const groupPending = this._pending(peer, own);
+      if (peerInput) Object.assign(peerInput, { pendingBytes: groupPending.bytes, apiActive: groupPending.concurrent });
       physicalReservedBytes += groupPending.bytes;
       physicalConcurrent += groupPending.concurrent;
       up += Math.max(Number(peer.maindata.uploadSpeed), nonnegative(peer.avgUploadSpeed) ? Number(peer.avgUploadSpeed) : 0);
       down += Math.max(Number(peer.maindata.downloadSpeed), nonnegative(peer.avgDownloadSpeed) ? Number(peer.avgDownloadSpeed) : 0);
     }
+    detail({ usedUploadBps: up, usedDownloadBps: down, sharedReservedBytes: physicalReservedBytes, sharedApiActive: physicalConcurrent });
     for (const [value, current, reason] of [
       [client.maxUploadSpeed, up, 'client-upload-limit'],
       [client.maxDownloadSpeed, down, 'client-download-limit'],
@@ -193,18 +210,27 @@ class RssAllocator {
     if (request.hash && pending.hashes.has(request.hash)) return reject('duplicate-inflight');
     const upCapacity = client.uploadBandwidth === undefined ? bandwidth.DEFAULT_BPS : Number(client.uploadBandwidth);
     const downCapacity = client.downloadBandwidth === undefined ? bandwidth.DEFAULT_BPS : Number(client.downloadBandwidth);
+    detail({ uploadCapacityBps: rssAudit.number(upCapacity), downloadCapacityBps: rssAudit.number(downCapacity) });
     if (!Number.isSafeInteger(upCapacity) || !Number.isSafeInteger(downCapacity) || upCapacity <= 0 || downCapacity <= 0) return reject('bandwidth-invalid');
     const upHeadroom = Math.max(0, upCapacity - up);
     const downHeadroom = Math.max(0, downCapacity - down);
     const size = nonnegative(request.size) && Number(request.size) > 0 ? Number(request.size) : this.limits.spaceChunkBytes;
     const bytes = request.reseed ? 0 : Math.min(size, this.limits.spaceChunkBytes);
     const usableSpace = Number(data.freeSpaceOnDisk) - positiveLimit(client.minFreeSpace) - physicalReservedBytes - down * this.limits.spaceHorizonSeconds;
+    detail({
+      uploadHeadroomBps: upHeadroom,
+      downloadHeadroomBps: downHeadroom,
+      usableSpaceBytes: usableSpace,
+      reservedBytes: bytes,
+      writeReserveBytes: down * this.limits.spaceHorizonSeconds
+    });
     if (!request.reseed && usableSpace < bytes) return reject('space-reserve');
     const mode = request.mode || 'uploadSpeed';
     const upFraction = upHeadroom / upCapacity;
     const downFraction = downHeadroom / downCapacity;
     const queued = nonnegative(data.queuedIO) ? Number(data.queuedIO) : 0;
     const ioFactor = 1 / (1 + queued / 100);
+    detail({ uploadFreeFraction: upFraction, downloadFreeFraction: downFraction, ioFactor });
     let weight;
     if (mode === 'uploadSpeed') weight = upHeadroom * downFraction * ioFactor;
     else if (mode === 'downloadSpeed') weight = downHeadroom * upFraction * ioFactor;
@@ -212,17 +238,21 @@ class RssAllocator {
     else if (mode === 'leechingCount') weight = upFraction * downFraction * ioFactor / (count + 1);
     else return reject('mode-invalid');
     if (!request.reseed && (!Number.isFinite(weight) || weight <= 0)) return reject('no-headroom');
-    return { eligible: true, client, weight: request.reseed ? 1 : weight, bytes, count, pending, physicalConcurrent, upCapacity, downCapacity, upHeadroom, downHeadroom, usableSpace, mode };
+    return { eligible: true, client, weight: request.reseed ? 1 : weight, bytes, count, pending, physicalConcurrent, upCapacity, downCapacity, upHeadroom, downHeadroom, usableSpace, mode, audit: input };
   }
 
   _tryAcquire (request) {
     const now = this.now();
     this._sweep(now);
-    if (request.isActive && !request.isActive()) return { ok: false, reason: 'rss-destroyed' };
+    const finish = result => {
+      rssAudit.safe(request.audit, 'decision', result, request, this.clients(), this.limits);
+      return result;
+    };
+    if (request.isActive && !request.isActive()) return finish({ ok: false, reason: 'rss-destroyed' });
     if (request.rss?.skipSameTorrent && request.hash) {
-      if (this.recentHashes.has(request.hash)) return { ok: false, reason: 'duplicate-recent' };
+      if (this.recentHashes.has(request.hash)) return finish({ ok: false, reason: 'duplicate-recent' });
       for (const state of this.states.values()) {
-        if (Array.from(state.tokens.values()).some(token => token.hashes.has(request.hash))) return { ok: false, reason: 'duplicate-inflight' };
+        if (Array.from(state.tokens.values()).some(token => token.hashes.has(request.hash))) return finish({ ok: false, reason: 'duplicate-inflight' });
       }
     }
     const ids = Array.from(new Set(request.forcedClientId ? [request.forcedClientId] : request.clientIds || [])).sort();
@@ -233,8 +263,9 @@ class RssAllocator {
       if (metric.eligible && !this.states.has(id) && this.states.size >= this.limits.maxFairClients) reasons[id] = 'allocator-state-limit';
       else if (metric.eligible) candidates.push(metric);
       else reasons[id] = metric.reason;
+      rssAudit.safe(request.audit, 'candidate', id, reasons[id] ? { ...metric, eligible: false, reason: reasons[id] } : metric);
     }
-    if (candidates.length === 0) return { ok: false, reason: 'no-eligible-client', reasons, busy: Object.values(reasons).includes('add-busy') };
+    if (candidates.length === 0) return finish({ ok: false, reason: 'no-eligible-client', reasons, busy: Object.values(reasons).includes('add-busy') });
     let selected;
     let fairKey;
     const fairChanges = [];
@@ -252,7 +283,9 @@ class RssAllocator {
           this.fair.set(key, entry);
         }
         const delta = metric.weight / total;
+        const creditBefore = entry.credit;
         entry.credit += delta;
+        rssAudit.safe(request.audit, 'fair', metric.client.id, creditBefore, delta, entry.credit);
         fairChanges.push({ key, entry, delta });
         entry.usedAt = now;
         if (entry.credit > highest) {
@@ -262,6 +295,7 @@ class RssAllocator {
         }
       }
       this.fair.get(fairKey).credit -= 1;
+      rssAudit.safe(request.audit, 'debit', selected.client.id, this.fair.get(fairKey).credit);
       fairChanges.find(change => change.key === fairKey).delta -= 1;
     }
     const client = selected.client;
@@ -279,7 +313,7 @@ class RssAllocator {
       metric: selected
     };
     this._state(client.id).tokens.set(token.id, token);
-    return { ok: true, client, token };
+    return finish({ ok: true, client, token });
   }
 
   async acquire (request) {
@@ -296,6 +330,7 @@ class RssAllocator {
       this._sweep(this.now());
       if (token.status !== 'reserved' || (token.request.isActive && !token.request.isActive())) return { ok: false, reason: 'lease-expired' };
       const metric = this.inspect(token.client, { ...token.request, hash: null }, token);
+      if (token.request.audit) token.dispatchMetric = metric;
       if (!metric.eligible) return { ok: false, reason: metric.reason };
       if (metric.physicalConcurrent < this.limits.maxConcurrentAdds) {
         token.status = 'ready';
@@ -321,6 +356,7 @@ class RssAllocator {
       }
     }
     const metric = this.inspect(token.client, { ...token.request, hash: null }, token);
+    if (token.request.audit) token.dispatchMetric = metric;
     if (!metric.eligible) return { ok: false, reason: metric.reason };
     if (metric.physicalConcurrent >= this.limits.maxConcurrentAdds) return { ok: false, reason: 'add-busy' };
     token.status = 'submitted';

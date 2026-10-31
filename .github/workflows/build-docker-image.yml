@@ -43,6 +43,8 @@ jobs:
         npm i --legacy-peer-deps --save-dev
     - name: RSS and Client Regression Tests
       run: npm run test:rss && npm run test:client
+    - name: Independent RSS Telemetry Regression Tests
+      run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/vertex-telemetry -p 'test_*.py'
     - name: Auto-fix ESLint Issues
       run: |
         npm run eslint -- --fix || true

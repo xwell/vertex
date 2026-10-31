@@ -578,6 +578,7 @@ class Rss {
     // Include explicit rule/reseed targets: an empty ordinary candidate set
     // must not reject a healthy forced route before its predicate is evaluated.
     if (!dispatcher.canPrepare.call(this)) {
+      dispatcher.noClient.call(this, newTorrents);
       await this._batchRejectTorrents(newTorrents, '拒绝原因: 无可用下载器');
       return;
     }

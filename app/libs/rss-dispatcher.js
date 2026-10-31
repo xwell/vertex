@@ -1,10 +1,18 @@
+const rssAudit = require('./rss-audit');
+
 // Dependencies are injected by Rss: this module does not open Redis/SQLite or
 // start timers itself, and the real dispatch path can be tested in isolation.
 module.exports = ({ rss, util, logger, redis, moment, allocator }) => {
   const active = task => !task.destroyed;
+  const preflights = new WeakMap();
+  const makeAudit = (task, torrent, options) => {
+    try { return rssAudit.create(logger, task, torrent, options, () => allocator.now()); } catch (error) { return undefined; }
+  };
 
   async function dispatch (task, torrent, options, send) {
+    const audit = makeAudit(task, torrent, options);
     const request = {
+      audit,
       clientIds: options.clientIds || task.clientArr,
       forcedClientId: options.forcedClientId,
       reseed: !!options.reseed,
@@ -15,7 +23,15 @@ module.exports = ({ rss, util, logger, redis, moment, allocator }) => {
       isActive: () => active(task)
     };
     const allocation = await allocator.acquire(request);
-    if (!allocation.ok) return allocation;
+    if (!allocation.ok) {
+      rssAudit.safe(audit, 'result', 'rejected', allocation.reason);
+      return allocation;
+    }
+    const deny = (result, reason) => {
+      rssAudit.safe(audit, 'checked', allocation.token);
+      rssAudit.safe(audit, 'result', 'cancelled', reason);
+      return result;
+    };
     const { token, client } = allocation;
     let accepted = false;
     let addedAt;
@@ -26,28 +42,30 @@ module.exports = ({ rss, util, logger, redis, moment, allocator }) => {
         accepted = true;
         addedAt = moment().unix();
         allocator.accepted(token);
+        rssAudit.safe(audit, 'result', 'accepted');
       }
     };
     try {
       if (task.skipSameTorrent && !options.reseed) {
         const exist = await task.checkTorrentExistsInClient(client.id, torrent);
-        if (exist?.exists) return { ok: false, reason: exist.reason, client };
+        if (exist?.exists) return deny({ ok: false, reason: exist.reason, client }, 'duplicate-client');
         const same = await util.getRecord('SELECT * FROM torrents WHERE hash = ? AND add_time > ? AND record_type = 1', [torrent.hash, moment().unix() - 600]);
-        if (same?.id) return { ok: false, reason: '拒绝原因: 种子已添加过', client };
+        if (same?.id) return deny({ ok: false, reason: '拒绝原因: 种子已添加过', client }, 'duplicate-history');
         if (client._client?.type === 'qBittorrent') {
           const peer = client.maindata.torrents.find(item => +item.size === +torrent.size);
           if (peer) {
             await task.cacheTorrentToClient(client.id, peer);
-            return { ok: false, reason: '拒绝原因: 下载器中已存在同大小种子', client };
+            return deny({ ok: false, reason: '拒绝原因: 下载器中已存在同大小种子', client }, 'duplicate-size');
           }
         }
       }
       const readiness = await allocator.ready(token);
-      if (!readiness.ok) return { ...readiness, client };
-      if (options.rule && !task._fitRule(options.rule, torrent, allocator.ruleContext(token))) return { ok: false, reason: 'accept-rule-changed', client };
+      if (!readiness.ok) return deny({ ...readiness, client }, readiness.reason);
+      if (options.rule && !task._fitRule(options.rule, torrent, allocator.ruleContext(token))) return deny({ ok: false, reason: 'accept-rule-changed', client }, 'accept-rule-changed');
       const check = allocator.begin(token, options.truehash);
-      if (!check.ok) return { ...check, client };
+      if (!check.ok) return deny({ ...check, client }, check.reason);
       logger.info(task.alias, 'RSS分配:', JSON.stringify({ ...allocator.describe(token), ruleId: options.rule?.id || null }));
+      rssAudit.safe(audit, 'submitted', token);
       try {
         await send(client, admission);
         // Adapters/mocks predating the admission hook return only after their
@@ -56,6 +74,7 @@ module.exports = ({ rss, util, logger, redis, moment, allocator }) => {
       } catch (error) {
         if (!accepted) {
           allocator.failed(token);
+          rssAudit.safe(audit, 'result', 'uncertain', 'post-error', error.code || error.name);
           logger.error(task.alias, 'RSS添加结果:', JSON.stringify({ lease: token.id, clientId: client.id, outcome: 'uncertain', error: error.code || error.name || 'Error' }));
           return { ok: false, reason: '添加请求失败，结果待确认', client, uncertain: true };
         }
@@ -68,6 +87,7 @@ module.exports = ({ rss, util, logger, redis, moment, allocator }) => {
     } finally {
       // Only unsent reservations are cancelled. Confirmed/uncertain requests
       // stay in the shared ledger until independently observed/reconciled.
+      if (!audit?.finished) rssAudit.safe(audit, 'result', token.status === 'submitted' ? 'interrupted' : 'cancelled', 'dispatch-interrupted');
       allocator.cancel(token);
     }
   }
@@ -76,7 +96,13 @@ module.exports = ({ rss, util, logger, redis, moment, allocator }) => {
     const task = this;
     const startedAt = Date.now();
     const records = { noteRows: [], noteCategoryRows: [], addRows: [] };
-    const reject = async (reason, client, type = 2) => {
+    const reject = async (reason, client, type = 2, alreadyAudited = false) => {
+      if (!alreadyAudited) {
+        const audit = makeAudit(task, torrent, { clientIds: explicitClient ? [explicitClient.id] : task.clientArr });
+        const code = ({ RSS任务已销毁: 'rss-destroyed', 非免费种: 'not-free', HR: 'hr', 抓取免费种子失败: 'free-scrape-failed', '抓取 HR 种子失败': 'hr-scrape-failed', 不符合所有规则: 'no-rule-match', 种子下载链接替换正则表达式无效: 'invalid-regex' })[reason] || 'preparation-rejected';
+        rssAudit.safe(audit, 'preflight', [], allocator.limits, code);
+        rssAudit.safe(audit, 'result', 'filtered', code);
+      }
       const note = reason.startsWith('拒绝原因:') ? reason : '拒绝原因: ' + reason;
       records.noteRows.push([torrent.hash, torrent.name, torrent.size, task.id, torrent.link, moment().unix(), type, note, client?.id || null]);
       try { await task.ntf.rejectTorrent(task._rss, client, torrent, note); } catch (error) { logger.error(task.alias, 'RSS拒绝通知失败:', error.name); }
@@ -107,7 +133,7 @@ module.exports = ({ rss, util, logger, redis, moment, allocator }) => {
             try { await task.ntf.addTorrent(task._rss, result.client, torrent); } catch (error) { logger.error(task.alias, 'RSS辅种通知失败:', error.name); }
             return records;
           }
-          if (result.uncertain) return reject(result.reason, result.client, 3);
+          if (result.uncertain) return reject(result.reason, result.client, 3, true);
         }
       }
     }
@@ -185,7 +211,7 @@ module.exports = ({ rss, util, logger, redis, moment, allocator }) => {
     });
     if (!result.ok) {
       const reasons = result.reasons ? Object.values(result.reasons).join(',') : result.reason;
-      return reject(result.reason === 'no-eligible-client' ? '无可用下载器: ' + reasons : result.reason, result.client, result.uncertain ? 3 : 2);
+      return reject(result.reason === 'no-eligible-client' ? '无可用下载器: ' + reasons : result.reason, result.client, result.uncertain ? 3 : 2, true);
     }
     const client = result.client;
     task._logTorrentTiming(torrent, '添加完成', startedAt, client);
@@ -225,16 +251,31 @@ module.exports = ({ rss, util, logger, redis, moment, allocator }) => {
 
   function canPrepare () {
     allocator.refresh();
+    preflights.delete(this);
+    const candidates = [];
     const ids = new Set([...(this.clientArr || []), ...this.acceptRules.map(rule => rule.client).filter(Boolean), ...(this.autoReseed ? this.reseedClients || [] : [])]);
     for (const id of ids) {
       const reseed = !!this.autoReseed && (this.reseedClients || []).includes(id);
       // This is only a source-level preflight before reading actual torrents.
       // Do not require a full 256 MiB chunk when a smaller torrent could fit.
-      const metric = allocator.inspect(global.runningClient?.[id], { mode: this.clientSortBy || 'uploadSpeed', rss: this, reseed, size: 1 });
+      const metric = allocator.inspect(global.runningClient?.[id], { mode: this.clientSortBy || 'uploadSpeed', rss: this, reseed, size: 1, audit: {} });
       if (metric.eligible) return true;
+      if (candidates.length < 256) candidates.push({ clientId: rssAudit.id(id), considered: true, ...metric.audit, eligible: false, reason: metric.reason, weight: rssAudit.number(metric.weight) });
     }
+    preflights.set(this, { candidates, inputAtMs: allocator.now(), snapshotTruncated: ids.size > candidates.length });
     return false;
   }
 
-  return { push, batch, canPrepare };
+  function noClient (torrents) {
+    const preflight = preflights.get(this);
+    for (const torrent of torrents) {
+      const audit = makeAudit(this, torrent, {});
+      rssAudit.safe(audit, 'preflight', preflight?.candidates || [], allocator.limits, 'no-eligible-client',
+        { inputAtMs: preflight?.inputAtMs || null, preflightProbeBytes: 1, snapshotTruncated: !!preflight?.snapshotTruncated });
+      rssAudit.safe(audit, 'result', 'rejected', 'no-eligible-client');
+    }
+    preflights.delete(this);
+  }
+
+  return { push, batch, canPrepare, noClient };
 };
