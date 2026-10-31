@@ -44,7 +44,17 @@ jobs:
     - name: RSS and Client Regression Tests
       run: npm run test:rss && npm run test:client
     - name: Independent RSS Telemetry Regression Tests
-      run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/vertex-telemetry -p 'test_*.py'
+      run: |
+        if ! PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -v -s tools/vertex-telemetry -p 'test_*.py' > /tmp/telemetry-tests.log 2>&1; then
+          python3 - <<'PY'
+        from pathlib import Path
+        text = Path('/tmp/telemetry-tests.log').read_text()[-12000:]
+        print('::error title=RSS telemetry test failure::' + text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A'))
+        PY
+          cat /tmp/telemetry-tests.log
+          exit 1
+        fi
+        cat /tmp/telemetry-tests.log
     - name: Auto-fix ESLint Issues
       run: |
         npm run eslint -- --fix || true
