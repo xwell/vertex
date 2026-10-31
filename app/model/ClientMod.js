@@ -5,8 +5,10 @@ const Rss = require('../common/Rss');
 const logger = require('../libs/logger');
 
 const util = require('../libs/util');
+const bandwidth = require('../libs/bandwidth');
 class ClientMod {
   add(options) {
+    bandwidth.validate(options);
     const id = util.uuid.v4().split('-')[0];
     const clientSet = { ...options };
     clientSet.id = id;
@@ -26,6 +28,8 @@ class ClientMod {
   };
 
   modify(options) {
+    // Validate before destroying a live client or writing a configuration file.
+    bandwidth.validate(options);
     const clientSet = { ...options };
     clientSet.deleteRules = clientSet.deleteRules || [];
     clientSet.sameServerClients = clientSet.sameServerClients || [];

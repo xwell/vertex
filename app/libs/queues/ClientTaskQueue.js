@@ -513,6 +513,7 @@ class ClientTaskQueue {
   }
 
   async executeGetMaindata(client) {
+    const requestStartedAt = Date.now();
     try {
       const res = await client.client.getMaindata(client.clientUrl, client.cookie);
 
@@ -550,6 +551,7 @@ class ClientTaskQueue {
         client.avgDownloadSpeed = res.downloadSpeed * 0.1 + (client.avgDownloadSpeed || 0) * 0.9;
         client.avgUploadSpeed = res.uploadSpeed * 0.1 + (client.avgUploadSpeed || 0) * 0.9;
 
+        client.lastMaindataRequestStartedAt = requestStartedAt;
         client.lastMaindataSuccessTime = Math.floor(Date.now() / 1000);
         client.status = true;
         client.errorCount = 0;

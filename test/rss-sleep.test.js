@@ -2,6 +2,7 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 const realMoment = require('moment');
 const { loadModule, createLogger } = require('./helpers/load-module');
+const { RssAllocator } = require('../app/libs/rss-allocator');
 
 const successKey = 'vertex:rss:last_success:test-rss';
 const sleepReason = '拒绝原因: 最长休眠时间';
@@ -44,6 +45,10 @@ function setup (t, previousAge = 60) {
       getTorrents: async url => {
         if (state.failFetch || url.includes('failed.test')) throw new Error('upstream unavailable');
         now += state.fetchSeconds;
+        // These tests isolate source sleep, with independently refreshed clients.
+        for (const client of Object.values(global.runningClient || {})) {
+          if (client.status) client.lastMaindataSuccessTime = now;
+        }
         return state.items.map(item => ({ ...item }));
       }
     },
@@ -73,6 +78,7 @@ function setup (t, previousAge = 60) {
     'node-cron': { schedule: () => ({ stop () {} }) },
     moment: clock,
     '../libs/queues/RssTaskQueue': Queue,
+    '../libs/rss-allocator': new RssAllocator({ now: () => now * 1000 }),
     '../libs/rate-limiter': {
       reset: async () => {},
       consume: async (key, limit, duration, count) => {
@@ -94,7 +100,7 @@ function setup (t, previousAge = 60) {
   global.runningRss = {};
   global.rssTaskQueue = new Queue();
   global.runningClient = {
-    one: { id: 'one', alias: 'mock-client', status: true, maindata: { leechingCount: 0, freeSpaceOnDisk: 1e15, downloadSpeed: 0 } }
+    one: { id: 'one', alias: 'mock-client', status: true, lastMaindataSuccessTime: now, maindata: { leechingCount: 0, freeSpaceOnDisk: 1e15, uploadSpeed: 0, downloadSpeed: 0, torrents: [] } }
   };
   const createTask = (options = {}) => {
     const task = new Rss({
@@ -136,7 +142,12 @@ function setup (t, previousAge = 60) {
     state,
     items,
     time: () => now,
-    advance: seconds => { now += seconds; }
+    advance: seconds => {
+      now += seconds;
+      for (const client of Object.values(global.runningClient || {})) {
+        if (client.status) client.lastMaindataSuccessTime = now;
+      }
+    }
   };
 }
 
@@ -251,7 +262,7 @@ test('a successful empty feed establishes a baseline without a downloader', asyn
   await task.rss();
   assert.equal(task.lastRssTime, h.time());
   assert.equal(h.history.size, 0);
-  global.runningClient.one = { id: 'one', alias: 'mock', status: true, maindata: {} };
+  global.runningClient.one = { id: 'one', alias: 'mock', status: true, lastMaindataSuccessTime: h.time(), maindata: { uploadSpeed: 0, downloadSpeed: 0, leechingCount: 0, freeSpaceOnDisk: 1e15, torrents: [] } };
   h.advance(60);
   h.state.items = h.items(1);
   await task.rss();

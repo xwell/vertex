@@ -228,13 +228,15 @@
         <a-form-item
           label="上传带宽"
           name="uploadBandwidth"
-          extra="下载器的实际上传带宽，用于智能分配计算，默认 1Gbps">
+          extra="实际可持续上传容量，不是限速。默认 1000 Mbps；500 Mbps = 约 59.6 MiB/s。旧字节单位不会自动换算为 Gbps。">
           <a-input size="small" v-model:value="downloader.uploadBandwidth">
             <template #addonAfter>
               <a-select size="small" v-model:value="downloader.uploadBandwidthUnit" placeholder="选择单位" style="width: 120px">
-                <a-select-option value="KiB">KiB/s</a-select-option>
-                <a-select-option value="MiB">MiB/s</a-select-option>
-                <a-select-option value="GiB">GiB/s</a-select-option>
+                <a-select-option value="Mbps">Mbps</a-select-option>
+                <a-select-option value="Gbps">Gbps</a-select-option>
+                <a-select-option value="KiB">KiB/s（旧）</a-select-option>
+                <a-select-option value="MiB">MiB/s（旧）</a-select-option>
+                <a-select-option value="GiB">GiB/s（旧）</a-select-option>
               </a-select>
             </template>
           </a-input>
@@ -242,13 +244,15 @@
         <a-form-item
           label="下载带宽"
           name="downloadBandwidth"
-          extra="下载器的实际下载带宽，用于智能分配计算，默认 1Gbps">
+          extra="实际可持续下载容量，不是限速。默认 1000 Mbps；用于下载余量及上传分配的负载保护。">
           <a-input size="small" v-model:value="downloader.downloadBandwidth">
             <template #addonAfter>
               <a-select size="small" v-model:value="downloader.downloadBandwidthUnit" placeholder="选择单位" style="width: 120px">
-                <a-select-option value="KiB">KiB/s</a-select-option>
-                <a-select-option value="MiB">MiB/s</a-select-option>
-                <a-select-option value="GiB">GiB/s</a-select-option>
+                <a-select-option value="Mbps">Mbps</a-select-option>
+                <a-select-option value="Gbps">Gbps</a-select-option>
+                <a-select-option value="KiB">KiB/s（旧）</a-select-option>
+                <a-select-option value="MiB">MiB/s（旧）</a-select-option>
+                <a-select-option value="GiB">GiB/s（旧）</a-select-option>
               </a-select>
             </template>
           </a-input>
@@ -385,10 +389,10 @@ export default {
         autoReannounce: true,
         autoDelete: true,
         deleteRules: [],
-        uploadBandwidth: 1,
-        uploadBandwidthUnit: 'GiB',
-        downloadBandwidth: 1,
-        downloadBandwidthUnit: 'GiB'
+        uploadBandwidth: 1000,
+        uploadBandwidthUnit: 'Mbps',
+        downloadBandwidth: 1000,
+        downloadBandwidthUnit: 'Mbps'
       },
       loading: true,
       registCode: []

@@ -34,6 +34,7 @@ jobs:
         echo "DOCKER_BUILDKIT=1" >> $GITHUB_ENV
         echo "IMAGE_TAG_BRANCH=wexwell/vertex-optimized:$CI_COMMIT_BRANCH" >> $GITHUB_ENV
         echo "IMAGE_TAG_TIMEVERSION=wexwell/vertex-optimized:$TIMEVERSION" >> $GITHUB_ENV
+        echo "IMAGE_TAG_COMMIT=wexwell/vertex-optimized:sha-${{ github.sha }}" >> $GITHUB_ENV
         echo "PUSH_TIME=$PUSH_TIME" >> $GITHUB_ENV
     - name: Install Dependencies
       run: |
@@ -96,9 +97,13 @@ jobs:
     - name: Build Docker Images
       working-directory: ./docker
       run: |
-        docker buildx build --platform linux/amd64,linux/arm64 --cache-from wexwell/vertex-optimized --tag $IMAGE_TAG_LATEST --build-arg BUILDKIT_INLINE_CACHE=1 . --push
-        docker buildx build --platform linux/amd64,linux/arm64 --cache-from wexwell/vertex-optimized --tag $IMAGE_TAG_BRANCH --build-arg BUILDKIT_INLINE_CACHE=1 . --push
-        docker buildx build --platform linux/amd64,linux/arm64 --cache-from wexwell/vertex-optimized --tag $IMAGE_TAG_TIMEVERSION --build-arg BUILDKIT_INLINE_CACHE=1 . --push
+        docker buildx build --platform linux/amd64,linux/arm64 \
+          --cache-from wexwell/vertex-optimized \
+          --tag "$IMAGE_TAG_LATEST" --tag "$IMAGE_TAG_BRANCH" \
+          --tag "$IMAGE_TAG_TIMEVERSION" --tag "$IMAGE_TAG_COMMIT" \
+          --label "org.opencontainers.image.revision=$CI_COMMIT_SHA" \
+          --label "org.opencontainers.image.source=https://github.com/xwell/vertex" \
+          --build-arg BUILDKIT_INLINE_CACHE=1 . --push
     - name: Build Success Notification
       run: |
         echo "🎉 Docker镜像构建成功！"
@@ -106,5 +111,6 @@ jobs:
         echo "   - $IMAGE_TAG_LATEST"
         echo "   - $IMAGE_TAG_BRANCH" 
         echo "   - $IMAGE_TAG_TIMEVERSION"
+        echo "   - $IMAGE_TAG_COMMIT"
         echo "🚀 使用方法："
         echo "   docker pull $IMAGE_TAG_LATEST"

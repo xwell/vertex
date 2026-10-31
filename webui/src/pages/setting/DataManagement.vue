@@ -149,6 +149,8 @@
 </template>
 
 <script>
+import { h } from 'vue';
+import { Tag } from 'ant-design-vue';
 import settingApi from '../../api/setting';
 
 export default {
@@ -188,11 +190,7 @@ export default {
           dataIndex: 'canAggregate',
           key: 'canAggregate',
           width: 120,
-          render: (canAggregate) => (
-            <a-tag color={canAggregate ? 'green' : 'orange'}>
-              {canAggregate ? '是' : '否'}
-            </a-tag>
-          )
+          render: canAggregate => h(Tag, { color: canAggregate ? 'green' : 'orange' }, () => canAggregate ? '是' : '否')
         }
       ]
     };

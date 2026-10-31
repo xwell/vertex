@@ -2,6 +2,7 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 const realMoment = require('moment');
 const { loadModule, createLogger } = require('./helpers/load-module');
+const { RssAllocator } = require('../app/libs/rss-allocator');
 
 function setup (getTorrents = async () => [], moment = realMoment) {
   const logger = createLogger();
@@ -19,6 +20,7 @@ function setup (getTorrents = async () => [], moment = realMoment) {
     moment,
     '../libs/queues/RssTaskQueue': class {},
     '../libs/rate-limiter': {},
+    '../libs/rss-allocator': new RssAllocator({ now: () => moment().valueOf() }),
     './Push': class {}
   });
   const task = Object.assign(Object.create(Rss.prototype), {
@@ -51,14 +53,17 @@ function setup (getTorrents = async () => [], moment = realMoment) {
 }
 
 function client (id) {
-  return {
+  const value = {
     id,
     alias: id,
     status: true,
+    lastMaindataSuccessTime: Math.floor(Date.now() / 1000),
     avgUploadSpeed: 0,
     avgDownloadSpeed: 0,
     maindata: { uploadSpeed: 0, downloadSpeed: 0, leechingCount: 0, freeSpaceOnDisk: 1e15, torrents: [] }
   };
+  global.runningClient = { ...global.runningClient, [id]: value };
+  return value;
 }
 
 function torrent (index) {
@@ -107,32 +112,29 @@ test('dryrun exposes source errors instead of displaying an empty success', asyn
   await assert.rejects(task.dryrun(), /invalid XML/);
 });
 
-test('each client runs at most 15 torrent jobs in one RSS task, while clients remain parallel', async t => {
+test('one RSS bounds preparation to 15 workers and records results despite an item failure', async t => {
   const previous = global.runningClient;
   t.after(() => { global.runningClient = previous; });
   global.runningClient = { one: client('one'), two: client('two') };
   const { task, writes, logger } = setup();
   task.clientArr = ['one', 'two'];
-  const active = { one: 0, two: 0 };
-  const peaks = { one: 0, two: 0 };
+  let active = 0;
+  let peak = 0;
   const handled = new Set();
-  let overlapped = false;
-  task._pushTorrent = async (item, selected) => {
-    active[selected.id]++;
-    peaks[selected.id] = Math.max(peaks[selected.id], active[selected.id]);
-    overlapped = overlapped || (active.one > 0 && active.two > 0);
-    assert.ok(active[selected.id] <= 15);
+  task._pushTorrent = async item => {
+    active++;
+    peak = Math.max(peak, active);
+    assert.ok(active <= 15);
     await new Promise(resolve => setTimeout(resolve, 2));
-    active[selected.id]--;
+    active--;
     assert.ok(!handled.has(item.hash));
     handled.add(item.hash);
     if (item.hash === 'hash-7') throw new Error('one item failed');
     return { noteRows: [], noteCategoryRows: [], addRows: [[item.hash]] };
   };
   await task.rss(Array.from({ length: 80 }, (_, i) => torrent(i)));
-  assert.deepEqual(peaks, { one: 15, two: 15 });
+  assert.equal(peak, 15);
   assert.equal(handled.size, 80);
-  assert.equal(overlapped, true);
   assert.equal(writes.flatMap(write => write.rows).length, 79);
   assert.equal(task.persisted, undefined); // 手动传入种子不刷新订阅成功时间。
   const discovery = logger.entries.filter(entry => entry.args[1] === 'RSS种子阶段:')

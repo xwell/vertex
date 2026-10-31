@@ -83,12 +83,13 @@
         <a-form-item
           label="排序规则"
           name="clientSortBy"
+          extra="按所选资源的真实余量分摊，跨 RSS 保持公平；指定下载器规则优先，但仍受最终目标资源检查保护。"
           :rules="[{ required: true, message: '${label}不可为空! ' }]">
           <a-select size="small" v-model:value="rss.clientSortBy">
-            <a-select-option value="leechingCount">下载种子数量</a-select-option>
-            <a-select-option value="uploadSpeed">当前上传速度</a-select-option>
-            <a-select-option value="downloadSpeed">当前下载速度</a-select-option>
-            <a-select-option value="freeSpaceOnDisk">当前剩余空间</a-select-option>
+            <a-select-option value="leechingCount">下载负载均衡</a-select-option>
+            <a-select-option value="uploadSpeed">空闲上传带宽（原当前上传速度）</a-select-option>
+            <a-select-option value="downloadSpeed">空闲下载带宽（原当前下载速度）</a-select-option>
+            <a-select-option value="freeSpaceOnDisk">真实可用空间（原当前剩余空间）</a-select-option>
           </a-select>
         </a-form-item>
         <a-form-item

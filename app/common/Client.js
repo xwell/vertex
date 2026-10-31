@@ -9,6 +9,8 @@ const cron = require('node-cron');
 const Push = require('./Push');
 const ClientTaskQueue = require('../libs/queues/ClientTaskQueue');
 const trackerSync = require('../libs/tracker-sync');
+const bandwidth = require('../libs/bandwidth');
+const rssAllocator = require('../libs/rss-allocator');
 
 const clients = {
   qBittorrent: qb,
@@ -30,8 +32,8 @@ class Client {
     this.pushMessage = client.pushMessage;
     this.maxUploadSpeed = util.calSize(client.maxUploadSpeed, client.maxUploadSpeedUnit);
     this.maxDownloadSpeed = util.calSize(client.maxDownloadSpeed, client.maxDownloadSpeedUnit);
-    this.uploadBandwidth = util.calSize(client.uploadBandwidth, client.uploadBandwidthUnit) || 125000000; // 默认 1Gbps
-    this.downloadBandwidth = util.calSize(client.downloadBandwidth, client.downloadBandwidthUnit) || 125000000; // 默认 1Gbps
+    this.uploadBandwidth = bandwidth.parse(client.uploadBandwidth, client.uploadBandwidthUnit);
+    this.downloadBandwidth = bandwidth.parse(client.downloadBandwidth, client.downloadBandwidthUnit);
     this.minFreeSpace = util.calSize(client.minFreeSpace, client.minFreeSpaceUnit);
     this.alarmSpace = util.calSize(client.alarmSpace, client.alarmSpaceUnit);
     this.maxLeechNum = client.maxLeechNum;
@@ -85,6 +87,7 @@ class Client {
     this.trackerStatus = {};
     this.lastTrackerSyncTime = 0;
     this.lastMaindataSuccessTime = 0;
+    this.lastMaindataRequestStartedAt = 0;
     this.trackerSyncCursor = 0;
     this.trackerSyncBatchSize = client.trackerSyncBatchSize || 50;
     this.trackerSyncBatch = null;
@@ -295,6 +298,7 @@ class Client {
   };
 
   destroy() {
+    rssAllocator.destroyClient(this);
     logger.info('销毁下载器实例', this.alias);
     this.maindataJob.stop();
     delete this.maindataJob;
@@ -405,6 +409,7 @@ class Client {
     }
     const statusLeeching = ['downloading', 'stalledDL', 'Downloading'];
     const statusSeeding = ['uploading', 'stalledUP', 'Seeding'];
+    const requestStartedAt = Date.now();
     try {
       const maindata = await this.client.getMaindata(this.clientUrl, this.cookie);
       if (typeof maindata === 'string') {
@@ -444,6 +449,7 @@ class Client {
       }
       */
       logger.debug('下载器', this.alias, '获取种子信息成功');
+      this.lastMaindataRequestStartedAt = requestStartedAt;
       this.lastMaindataSuccessTime = moment().unix();
       this.status = true;
       this.errorCount = 0;
@@ -464,7 +470,7 @@ class Client {
     }
   };
 
-  async addTorrent(torrentUrl, hash, isSkipChecking = false, uploadLimit = 0, downloadLimit = 0, savePath, category, autoTMM, paused) {
+  async addTorrent(torrentUrl, hash, isSkipChecking = false, uploadLimit = 0, downloadLimit = 0, savePath, category, autoTMM, paused, admission) {
     if (!this.status) {
       throw new Error('客户端' + this.alias + '当前状态为不可用');
     }
@@ -473,7 +479,9 @@ class Client {
       this.login();
       throw new Error('状态码: ' + statusCode);
     }
-    if (this.maindata) {
+    if (admission?.reserved) {
+      admission.onAccepted();
+    } else if (this.maindata) {
       this.maindata.leechingCount += 1;
     }
     await util.runRecord('insert into torrent_flow (hash, upload, download, time) values (?, ?, ?, ?)',
@@ -486,13 +494,16 @@ class Client {
     }
   }
 
-  async addTorrentByTorrentFile(filepath, hash, isSkipChecking = false, uploadLimit = 0, downloadLimit = 0, savePath, category, autoTMM, paused) {
+  async addTorrentByTorrentFile(filepath, hash, isSkipChecking = false, uploadLimit = 0, downloadLimit = 0, savePath, category, autoTMM, paused, admission) {
+    if (!this.status) throw new Error('客户端' + this.alias + '当前状态为不可用');
     const { statusCode } = await this.client.addTorrentByTorrentFile(this.clientUrl, this.cookie, filepath, isSkipChecking, uploadLimit, downloadLimit, savePath, category, autoTMM, this.firstLastPiecePrio, paused);
     if (statusCode !== 200 && statusCode !== 202 && statusCode !== 204) {
       this.login();
       throw new Error('状态码: ' + statusCode);
     }
-    if (this.maindata) {
+    if (admission?.reserved) {
+      admission.onAccepted();
+    } else if (this.maindata) {
       this.maindata.leechingCount += 1;
     }
     await util.runRecord('insert into torrent_flow (hash, upload, download, time) values (?, ?, ?, ?)',

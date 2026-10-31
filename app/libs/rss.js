@@ -952,7 +952,9 @@ exports.getTorrents = async function (rssUrl) {
     return torrents;
   } catch (e) {
     // 不把失败伪装成空订阅；仅暴露主机及脱敏信息，避免日志泄露 passkey。
-    const message = String(e.message || e).replace(/https?:\/\/[^\s"'<>]+/gi, '[RSS URL]');
+    // Node 14 includes the entire invalid input in ERR_INVALID_URL.message,
+    // even when it has no http(s) scheme for the URL regex to redact.
+    const message = host === '无效RSS地址' ? 'URL 无效' : String(e.message || e).replace(/https?:\/\/[^\s"'<>]+/gi, '[RSS URL]');
     const error = new Error(`${host} 获取 RSS 失败: ${message}`);
     if (e.code) error.code = e.code;
     logger.error(error.message);

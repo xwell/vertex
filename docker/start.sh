@@ -139,5 +139,6 @@ export REDISPORT=`[ $REDISPORT ] && echo $REDISPORT || echo 6379`
 Xvfb -ac :99 -screen 0 1280x1024x16 &
 export DISPLAY=:99
 cp /usr/share/zoneinfo/$TZ /app/localtime
-/usr/bin/redis-server /app/redis.conf --port $REDISPORT
+# Keep manually saved Redis state on the data volume across container replacement.
+/usr/bin/redis-server /app/redis.conf --port $REDISPORT --dir /vertex/db --dbfilename redis.rdb
 su vt -c 'cd /app/vertex && node app/app.js > /dev/null'
