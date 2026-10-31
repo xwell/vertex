@@ -65,7 +65,7 @@ function create (logger, task, torrent, options = {}, now = Date.now) {
     sizeBytes: number(torrent.size),
     publishedAtMs: number(torrent.pubTime) === null ? null : number(torrent.pubTime) * 1000,
     discoveredAtMs: number(torrent._rssDiscoveredAt),
-    mode: ['uploadSpeed', 'downloadSpeed', 'freeSpaceOnDisk', 'leechingCount'].includes(task.clientSortBy) ? task.clientSortBy : 'uploadSpeed',
+    mode: !task.clientSortBy ? 'uploadSpeed' : ['uploadSpeed', 'downloadSpeed', 'freeSpaceOnDisk', 'leechingCount'].includes(task.clientSortBy) ? task.clientSortBy : 'unknown',
     route: options.reseed ? 'reseed' : forcedId ? 'forced' : 'weighted',
     originalClientIds: originalIds,
     originalClientCount: Array.isArray(options.clientIds || task.clientArr) ? new Set(options.clientIds || task.clientArr).size : 0,
@@ -170,7 +170,7 @@ function create (logger, task, torrent, options = {}, now = Date.now) {
         finalInput,
         error: typeof error === 'string' && /^[\w-]{1,64}$/.test(error) ? error : null,
         submitted: sentAtMs !== null,
-        fairnessRefunded: sentAtMs === null && context.route === 'weighted',
+        fairnessRefunded: lease !== null && sentAtMs === null && context.route === 'weighted',
         elapsedMs: now() - startedAtMs,
         postMs: sentAtMs === null ? null : now() - sentAtMs
       });

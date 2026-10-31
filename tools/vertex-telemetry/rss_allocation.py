@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS rss_names(kind TEXT,id TEXT,alias TEXT,PRIMARY KEY(ki
 MAX_BYTES = 512 * 1024
 ID = re.compile(r'^[\w.:-]{1,200}$', re.ASCII)
 CODE = re.compile(r'^[a-zA-Z][a-zA-Z0-9-]{0,79}$')
-MODES = {'uploadSpeed', 'downloadSpeed', 'freeSpaceOnDisk', 'leechingCount'}
+MODES = {'uploadSpeed', 'downloadSpeed', 'freeSpaceOnDisk', 'leechingCount', 'unknown'}
 ROUTES = {'weighted', 'forced', 'reseed', 'unknown'}
 STAGES = {'decision', 'submitted', 'result'}
 NUMBERS = set('sampleAtMs sampleAgeMs requestStartedAtMs uploadBps downloadBps avgUploadBps avgDownloadBps uploadCapacityBps downloadCapacityBps freeBytes downloading minFreeBytes maxDownloading maxUploadBps maxDownloadBps queuedIO pendingAdds pendingDownloading pendingBytes apiActive effectiveDownloading usedUploadBps usedDownloadBps sharedReservedBytes sharedApiActive uploadHeadroomBps downloadHeadroomBps usableSpaceBytes reservedBytes writeReserveBytes uploadFreeFraction downloadFreeFraction ioFactor weight creditBefore normalizedShare creditAfter'.split())

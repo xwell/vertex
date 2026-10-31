@@ -117,6 +117,14 @@ test('real dispatcher emits decision/submitted/accepted and post failure stays u
   } finally { global.runningClient = previous; }
 });
 
+test('non-reserved rejections do not invent a fairness refund or a valid mode', async () => {
+  const h = harness();h.client('a');h.client('b');h.task.clientSortBy = 'invalid-setting';
+  const result = await h.acquire();assert.equal(result.ok, false);
+  result.telemetry.result('rejected', result.reason);
+  const events = h.events();assert.equal(events[0].mode, 'unknown');
+  assert.equal(events[0].candidates[0].reason, 'mode-invalid');assert.equal(events[1].fairnessRefunded, false);
+});
+
 test('source preflight records each rejected torrent with the exact captured matrix and no POST', () => {
   const h = harness();const a = h.client('a');a.status = false;h.task.clientArr = ['a'];
   const previous = global.runningClient;global.runningClient = h.clients;
