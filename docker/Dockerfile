@@ -10,6 +10,7 @@ RUN \
   git checkout COMMIT_ID && \
   rm .git webui -rf && \
   PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true npm i --save && \
+  node tools/maintenance/runtime-dependency-smoke.cjs && \
   mkdir /vertex && \
   ln -s /vertex/data /app/vertex/app/data && \
   ln -s /vertex/db /app/vertex/app/db && \
