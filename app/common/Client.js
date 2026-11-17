@@ -9,6 +9,7 @@ const cron = require('node-cron');
 const Push = require('./Push');
 const ClientTaskQueue = require('../libs/queues/ClientTaskQueue');
 const trackerSync = require('../libs/tracker-sync');
+const maindataGuard = require('../libs/maindata-request-guard');
 const bandwidth = require('../libs/bandwidth');
 const rssAllocator = require('../libs/rss-allocator');
 
@@ -189,7 +190,31 @@ class Client {
       totalDuration >= fitTime;
   };
 
+  _hasRuleSnapshot() {
+    const data = this.maindata;
+    return this.status !== false && !!data && Array.isArray(data.torrents) &&
+      Number.isFinite(data.freeSpaceOnDisk) && data.freeSpaceOnDisk >= 0;
+  }
+
+  _skipRuleSnapshot(rule) {
+    // Missing observations cannot count towards continuous/probabilistic confirmation.
+    for (const item of rule ? [rule] : (this.deleteRules || [])) {
+      if (this.fitTime?.[item.id]) this.fitTime[item.id] = {};
+      if (this.probabilisticStats?.[item.id]) this.probabilisticStats[item.id] = {};
+    }
+    this.ruleSnapshotSkipped = (this.ruleSnapshotSkipped || 0) + 1;
+    const now = Date.now();
+    if (!this.lastRuleSnapshotSkipLogAt || now - this.lastRuleSnapshotSkipLogAt >= 60000) {
+      this.lastRuleSnapshotSkipLogAt = now;
+      logger.warn('RULE_SNAPSHOT_SKIPPED ' + JSON.stringify({ clientId: this.id,
+        time: now / 1000, reason: 'snapshot-unavailable', skipped: this.ruleSnapshotSkipped }));
+    }
+    return false;
+  }
+
   _fitConditions(_torrent, conditions) {
+    if (!this._hasRuleSnapshot()) return false;
+    const maindata = this.maindata;
     let fit = true;
     const torrent = { ..._torrent };
     torrent.ratio = torrent.uploaded / torrent.size;
@@ -197,10 +222,10 @@ class Client {
     torrent.ratio3 = torrent.uploaded / torrent.totalSize;
     torrent.addedTime = moment().unix() - torrent.addedTime;
     torrent.completedTime = moment().unix() - (torrent.completedTime <= 0 ? moment().unix() : torrent.completedTime);
-    torrent.freeSpace = this.maindata.freeSpaceOnDisk;
+    torrent.freeSpace = maindata.freeSpaceOnDisk;
     torrent.secondFromZero = moment().unix() - moment().startOf('day').unix();
-    torrent.leechingCount = this.maindata.leechingCount;
-    torrent.seedingCount = this.maindata.seedingCount;
+    torrent.leechingCount = maindata.leechingCount;
+    torrent.seedingCount = maindata.seedingCount;
     torrent.globalUploadSpeed = this.avgUploadSpeed;
     torrent.globalDownloadSpeed = this.avgDownloadSpeed;
     for (const condition of conditions) {
@@ -247,6 +272,7 @@ class Client {
   }
 
   _fitDeleteRule(_rule, torrent, fitTimeJob) {
+    if (!this._hasRuleSnapshot()) return this._skipRuleSnapshot(_rule);
     const rule = { ..._rule };
     const maindata = { ...this.maindata };
     maindata.ruleId = rule.id;
@@ -298,6 +324,7 @@ class Client {
   };
 
   destroy() {
+    maindataGuard.cancel(this, 'client-destroyed');
     rssAllocator.destroyClient(this);
     logger.info('销毁下载器实例', this.alias);
     this.maindataJob.stop();
@@ -373,18 +400,25 @@ class Client {
   };
 
   async login(notify = true) {
-    try {
-      this.cookie = await this.client.login(this.username, this.clientUrl, this.password);
-      this.status = true;
-      this.errorCount = 0;
-      this.lastCookie = moment().unix();
-      logger.info('下载器', this.alias, '登录成功');
-    } catch (error) {
-      logger.error('下载器', this.alias, '登录失败\n', error);
-      await this.ntf.clientLoginError(this._client, error.message);
-      this.status = false;
-      this.maindata = null;
-      return;
+    if (maindataGuard.enabled(this)) {
+      try {
+        const result = await maindataGuard.execute(this, { forceLogin: true });
+        if (result?.maindataGuardIgnored) return;
+      } catch (_) { return; } // Guard owns current-generation failure state and safe diagnostics.
+    } else {
+      try {
+        this.cookie = await this.client.login(this.username, this.clientUrl, this.password);
+        this.status = true;
+        this.errorCount = 0;
+        this.lastCookie = moment().unix();
+        logger.info('下载器', this.alias, '登录成功');
+      } catch (error) {
+        logger.error('下载器', this.alias, '登录失败\n', error);
+        await this.ntf.clientLoginError(this._client, error.message);
+        this.status = false;
+        this.maindata = null;
+        return;
+      }
     }
     try {
       if (!this.messageId && notify) {
@@ -399,6 +433,22 @@ class Client {
   };
 
   async getMaindata() {
+    if (maindataGuard.enabled(this)) {
+      const needsConnectionNotice = !this.cookie;
+      // Construction assigns global.runningClient[id] immediately AFTER new Client returns.
+      // Defer the first guarded request until that synchronous identity registration is complete.
+      await Promise.resolve();
+      let result;
+      try { result = await maindataGuard.execute(this); } catch (_) { return; }
+      if (result?.maindataGuardIgnored) return;
+      try {
+        if (needsConnectionNotice && !this.messageId) {
+          await this.ntf.connectClient(this._client);
+          if (this.monitor.push) this.messageId = await this.mnt.connectClient(this._client);
+        } else if (this.monitor.push) await this.mnt.edit(this.messageId, this.maindata);
+      } catch (error) { logger.error('推送监控报错', '\n', error); }
+      return;
+    }
     if (!this.cookie) {
       this.login();
       return;
@@ -569,7 +619,8 @@ class Client {
   }
 
   async autoDelete() {
-    if (!this.maindata || !this.maindata.torrents || this.maindata.torrents.length === 0) return;
+    if (!this._hasRuleSnapshot()) return this._skipRuleSnapshot();
+    if (this.maindata.torrents.length === 0) return;
     this.deleteRuleExecutionId++;
     const needTrackerStatus = this._client.type === 'qBittorrent' &&
       this.deleteRules.some(rule => rule.type === 'javascript' && typeof rule.code === 'string' && rule.code.includes('trackerStatus'));
@@ -608,6 +659,7 @@ class Client {
       rule.deleteNum = rule.deleteNum || 1;
       let deletedNum = 0;
       for (const torrent of torrents) {
+        if (!this._hasRuleSnapshot()) return this._skipRuleSnapshot();
         if (rejectDeleteHash[torrent.hash]) {
           continue;
         }
@@ -628,6 +680,7 @@ class Client {
           await this.reannounceTorrent(torrent);
           logger.info(torrent.name, '重新汇报完毕, 等待 2s');
           await util.sleep(2000);
+          if (!this._hasRuleSnapshot()) return this._skipRuleSnapshot();
           logger.info(torrent.name, '等待 2s 完毕, 执行删种');
           await util.runRecord('update torrents set size = ?, tracker = ?, upload = ?, download = ?, delete_time = ?, record_note = ? where hash = ?',
             [torrent.size, torrent.tracker, torrent.uploaded, torrent.downloaded, moment().unix(), `删种规则: ${rule.alias}`, torrent.hash]);
@@ -682,7 +735,8 @@ class Client {
   };
 
   flashFitTime(rule) {
-    if (!this.maindata || !this.maindata.torrents || this.maindata.torrents.length === 0) return;
+    if (!this._hasRuleSnapshot()) return this._skipRuleSnapshot(rule);
+    if (this.maindata.torrents.length === 0) return;
     this.deleteRuleExecutionId++;
     try {
       const torrents = this.maindata.torrents;

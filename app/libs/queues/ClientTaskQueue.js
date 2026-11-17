@@ -2,6 +2,8 @@ const { TaskQueue } = require('../redis');
 const logger = require('../logger');
 const redis = require('../redis');
 const trackerSync = require('../tracker-sync');
+const maindataGuard = require('../maindata-request-guard');
+const maindataDiagnostics = require('../maindata-request-diagnostics');
 
 class ClientTaskQueueWorker extends TaskQueue {
   constructor(queueName, executor, options) {
@@ -273,7 +275,8 @@ class ClientTaskQueue {
 
     const dedupeConfig = this._getDedupeConfig(taskData);
     const queue = this._selectQueue(action);
-    return queue.enqueue(taskData, actualPriority, dedupeConfig);
+    const diagnosticData = maindataDiagnostics.queueData(global.runningClient?.[clientId], taskData);
+    return queue.enqueue(diagnosticData, actualPriority, dedupeConfig);
   }
 
   async getQueueStatus() {
@@ -379,6 +382,8 @@ class ClientTaskQueue {
     const { clientId, action, params } = task.data;
     let lockToken = null;
     let timeoutTimer = null;
+    let guardedMaindata = false;
+    let taskClient = null;
 
     try {
       if (this.isClientBlocked(clientId)) {
@@ -394,6 +399,7 @@ class ClientTaskQueue {
 
       const activeTask = this.activeClientTasks.get(clientId);
       if (activeTask) {
+        maindataDiagnostics.busy(client, task, activeTask);
         // A fixed 5s retry can phase-lock forever with flashFitTime's 5s cron.
         // Maintenance uses its deduplicated 2s continuation instead, while foreground retry semantics stay unchanged.
         if (action === 'trackerSync') {
@@ -435,12 +441,15 @@ class ClientTaskQueue {
         }
       }
 
-      lockToken = { action, startTime: Date.now(), control: action === 'trackerSync' ? trackerSync.createControl() : null };
+      guardedMaindata = action === 'getMaindata' && maindataGuard.enabled(client);
+      taskClient = client;
+      lockToken = { action, startTime: Date.now(), control: action === 'trackerSync' || guardedMaindata ? trackerSync.createControl() : null };
       this.activeClientTasks.set(clientId, lockToken);
 
       logger.debug(`开始执行客户端任务: ${client.alias}, 动作: ${action}`);
       const startTime = Date.now();
 
+      const diagnosticQueue = maindataDiagnostics.queueInfo(client, task);
       const timeoutMs = this._getActionTimeout(action, task.data);
       const timeoutPromise = new Promise((resolve, reject) => {
         timeoutTimer = setTimeout(() => {
@@ -452,7 +461,8 @@ class ClientTaskQueue {
       const taskPromise = (async () => {
         switch (action) {
           case 'getMaindata':
-            return await this.executeGetMaindata(client);
+            return await this.executeGetMaindata(client, guardedMaindata ? { timeoutMs, signal: lockToken.control,
+              diagnosticQueue } : undefined);
           case 'autoDelete':
             return await this.executeAutoDelete(client, params);
           case 'trackerSync':
@@ -470,6 +480,11 @@ class ClientTaskQueue {
 
       const result = await Promise.race([taskPromise, timeoutPromise]);
 
+      if (guardedMaindata && (result?.maindataGuardIgnored || global.runningClient[clientId] !== client)) {
+        const probe = this.failedClients.get(clientId);
+        if (global.runningClient[clientId] === client && probe?.state === 'HALF_OPEN') probe.halfOpenInFlight = false;
+        return;
+      }
       const duration = Date.now() - startTime;
       logger.debug(`客户端任务完成: ${client.alias}, 动作: ${action}, 耗时: ${duration}ms`);
 
@@ -479,6 +494,7 @@ class ClientTaskQueue {
 
       return result;
     } catch (error) {
+      if (guardedMaindata && global.runningClient[clientId] !== taskClient) return;
       if (this.isClientBlocked(clientId)) {
         logger.error(`客户端 ${clientId} 已被阻塞，任务已丢弃: ${task.data.action}`);
         return;
@@ -495,13 +511,14 @@ class ClientTaskQueue {
       }
 
       const client = global.runningClient[clientId];
-      if (client && action !== 'trackerSync') {
+      if (client && action !== 'trackerSync' && !guardedMaindata) {
         client.errorCount++;
         client.status = false;
       }
 
       logger.error(`客户端任务失败已处理: ${clientId}, 继续处理下一个任务`);
     } finally {
+      if (lockToken && taskClient) maindataDiagnostics.queueFinished(taskClient, action, lockToken.startTime);
       if (timeoutTimer) clearTimeout(timeoutTimer);
       lockToken?.control?.abort('slice-ended');
       if (lockToken && this.activeClientTasks.get(clientId) === lockToken) this.activeClientTasks.delete(clientId);
@@ -512,7 +529,8 @@ class ClientTaskQueue {
     }
   }
 
-  async executeGetMaindata(client) {
+  async executeGetMaindata(client, options) {
+    if (maindataGuard.enabled(client)) return await maindataGuard.execute(client, options);
     const requestStartedAt = Date.now();
     try {
       const res = await client.client.getMaindata(client.clientUrl, client.cookie);

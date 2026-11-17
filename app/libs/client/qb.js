@@ -2,8 +2,10 @@ const util = require('../util');
 const logger = require('../logger');
 const url = require('url');
 const fs = require('fs');
+const maindataDiagnostics = require('../maindata-request-diagnostics');
 
-exports.login = async function (username, clientUrl, password) {
+exports.login = async function (username, clientUrl, password, deadline) {
+  deadline = maindataDiagnostics.requestOptions(clientUrl, deadline, 'login');
   const message = {
     url: clientUrl + '/api/v2/auth/login',
     method: 'POST',
@@ -12,7 +14,7 @@ exports.login = async function (username, clientUrl, password) {
       password
     }
   };
-  const res = await util.requestPromise(message);
+  const res = deadline ? await util.requestPromise(message, false, deadline) : await util.requestPromise(message);
   // qBittorrent 5.2.0+ returns 204 No Content with empty body on successful login;
   // older versions return 200 with body "Ok." / "Fails.".
   const loginOk = res.statusCode === 204 || (res.body && res.body.indexOf('Ok') !== -1);
@@ -339,14 +341,15 @@ exports.setTorrentCategory = async function (clientUrl, cookie, hash, category) 
   return res;
 };
 
-exports.getMaindata = async function (clientUrl, cookie) {
+exports.getMaindata = async function (clientUrl, cookie, deadline) {
+  deadline = maindataDiagnostics.requestOptions(clientUrl, deadline, 'main-get');
   const option = {
     url: clientUrl + '/api/v2/sync/maindata',
     headers: {
       cookie
     }
   };
-  let res = await util.requestPromise(option);
+  let res = deadline ? await util.requestPromise(option, false, deadline) : await util.requestPromise(option);
   
   // 检查响应是否需要重新登录
   if (res.statusCode === 403 || (res.body && res.body.startsWith('Forbidden'))) {
