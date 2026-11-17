@@ -84,7 +84,10 @@ class RSSAuditTests(unittest.TestCase):
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM rss_events').fetchone()[0], 3)
         self.assertEqual(self.store.db.execute('SELECT sum(count) FROM rss_minutes').fetchone()[0], 3)
 
-    def test_legacy_events_are_selected_only_and_v2_upgrades_without_double_counting(self):
+    # Legacy timestamps have no atMs; keep this fixture inside its intended raw retention window.
+    # Freeze only the test clock, never relax production retention or skip payload assertions.
+    @mock.patch('time.time', return_value=1793433600)  # 2026-10-31 16:00:00 +08:00
+    def test_legacy_events_are_selected_only_and_v2_upgrades_without_double_counting(self, _clock):
         self.reader.parse('[2026-10-31T16:00:00.000] RSS分配: ' + json.dumps({'version': 1, 'lease': 'rss-add-1', 'clientId': 'rbx', 'mode': 'uploadSpeed', 'forced': False, 'uploadCapacityBps': 62500000}))
         old = self.store.db.execute('SELECT * FROM rss_events').fetchone()
         self.assertEqual(old['quality'], 'legacy-selected-only');self.assertIsNone(old['rss_id'])
