@@ -190,13 +190,13 @@ class Client {
       totalDuration >= fitTime;
   };
 
-  _hasRuleSnapshot() {
+  _hasRuleSnapshot () {
     const data = this.maindata;
     return this.status !== false && !!data && Array.isArray(data.torrents) &&
       Number.isFinite(data.freeSpaceOnDisk) && data.freeSpaceOnDisk >= 0;
   }
 
-  _skipRuleSnapshot(rule) {
+  _skipRuleSnapshot (rule) {
     // Missing observations cannot count towards continuous/probabilistic confirmation.
     for (const item of rule ? [rule] : (this.deleteRules || [])) {
       if (this.fitTime?.[item.id]) this.fitTime[item.id] = {};
